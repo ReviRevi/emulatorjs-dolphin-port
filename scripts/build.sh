@@ -53,5 +53,15 @@ rm -f "$WORK/EmulatorJS/data/cores/dolphin-sys.zip"
 (cd "$WORK/dolphin/Data" && zip -qr9 "$WORK/EmulatorJS/data/cores/dolphin-sys.zip" Sys \
    -x "Sys/Themes/*" "Sys/wiitdb-*.txt")
 
+# 6. Minified EmulatorJS (emulator.min.js/.css, so loader.js doesn't 404 and
+#    fall back to the unbundled sources) and a core report (its buildStart
+#    lets browsers cache the core until it changes).
+(cd "$WORK/EmulatorJS" && npm i --no-audit --no-fund --no-save rollup @rollup/plugin-terser \
+   @node-minify/core @node-minify/clean-css >/dev/null && npm run minify)
+mkdir -p "$WORK/EmulatorJS/data/cores/reports"
+HASH=$(cat "$WORK/EmulatorJS/data/cores/dolphin-thread-wasm.data" "$WORK/EmulatorJS/data/cores/dolphin-sys.zip" | sha1sum | cut -c1-12)
+echo "{\"buildStart\": $((16#$HASH)), \"options\": {\"defaultWebGL2\": true}}" \
+  > "$WORK/EmulatorJS/data/cores/reports/dolphin.json"
+
 ls -la "$WORK/EmulatorJS/data/cores/" | grep dolphin
 echo "Done. Serve $WORK/EmulatorJS (or copy data/ into dist/) with COOP/COEP headers."
