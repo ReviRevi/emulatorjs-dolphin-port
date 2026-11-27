@@ -117,14 +117,44 @@ Results in the build VM (2 vCPU, software WebGL), steady state:
 | + register locals (no gain on this test) | 42.9 |
 | + self-loops, tail calls | 58.5 (display-capped at 60) |
 
-Next: floating point / paired singles (all Interpreter fallbacks today; most game code),
-`mtspr`/`mfspr`, `lmw`/`stmw`, CR logic ops, `fres`/`frsqrte` tables. Match Jit64's FP behaviour
-(no full FPSCR exception tracking), not the Interpreter's.
+### Floating point / paired singles / SPRs (inline, `EmitInlineFP`)
+
+Rule: an inline result must be bit-identical to the Interpreter. Anything that could differ
+(NaN inputs/outputs, single-precision madd rounding ties, operands with excess precision) branches
+to the Interpreter call at run time. FPRF/FI/FR are not updated (same as Jit64's defaults); `Rc=1`
+forms go to the Interpreter.
+
+- Loads/stores: `lfs(u)(x)`, `lfd(u)(x)`, `stfs(u)(x)`, `stfd(u)(x)`; `psq_l(u)`/`psq_st(u)` for the
+  float GQR type (quantized integer types and HID2.LSQE=0 go to the Interpreter).
+- Opcode 59 (`fadds`..`fnmadds`), opcode 63 (`fadd/fsub/fmul/fdiv`, `fsel`, `fcmpu/fcmpo`, `frsp`,
+  `fctiwz`, `fmr/fneg/fabs/fnabs`), opcode 4 (`ps_*` arithmetic, merges, sums, muls/madds0/1,
+  compares, moves).
+- `mfspr`/`mtspr` for LR, CTR, XER (GetXER/SetXER split fields), GQR0-7, SPRG0-3 (supervisor ones
+  check MSR.PR at run time and fall back to the Interpreter, which raises the exception).
+
+Bisecting a miscompile: `globalThis.DOLPHIN_WASM_JIT_DISABLE = <bitmask>` turns groups back into
+Interpreter calls: 1 FP loads/stores, 2 psq, 4 FP single, 8 FP double, 16 FP moves, 32 FP compares,
+64 paired-single arithmetic, 128 integer.
+
+`test-content/fpbench`: paired-single/FP kernel; prints a checksum (rows 300/330) that must be the
+same with `DOLPHIN_WASM_JIT=0` and `2` (currently `c056 bd4f`). `scripts/readrow.py` reads it from
+a screenshot.
+
+| Test | JIT off | JIT on |
+|---|---|---|
+| cpubench | 23.1 fps | 56-58 fps (display-capped) |
+| fpbench | 11.0 fps | 32.8 fps |
+
+Bugs found this way: `psq_st` kept the second value in a local that address translation reused
+(wrong ps1 stored; likely the black screen after Start in Mario Superstar Baseball).
+
+Next: `mfcr`/`mtcrf`/`mcrf`, CR logic ops, quantized integer psq types, `fres`/`frsqrte`,
+`lmw`/`stmw`, FPRs cached in locals.
 
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
-2. **Performance**: extend the WebAssembly JIT (see above) to floating point / paired singles.
+2. **Performance**: keep extending the WebAssembly JIT (see its Next list). Heap is 2 GB even for tiny programs; check.
 3. Audio: confirm DSP HLE audio actually plays (RWebAudio path); tune `audio_latency`.
 4. Wii: needs Wiimote mapping defaults in EmulatorJS and NAND/SYSCONF handling; untested.
 5. Large ISOs: EmulatorJS loads the whole game into MEMFS (RAM). Prefer RVZ/compressed

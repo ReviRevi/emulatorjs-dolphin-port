@@ -1,8 +1,8 @@
 // CPU profile of the emulator page (main thread) for N seconds, aggregated by function.
-import { chromium } from 'playwright';  // npm i playwright
+import { chromium } from '/opt/npm-tools/node_modules/playwright/index.mjs';
 const mode = Number(process.argv[2] ?? 2);
 const game = process.argv[3] ?? 'cpubench.dol';
-const b = await chromium.launch({ headless: true,
+const b = await chromium.launch({ executablePath: '/usr/bin/google-chrome', headless: true,
   args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
 const p = await b.newPage({ viewport: { width: 1000, height: 760 } });
 await p.addInitScript((m) => { globalThis.DOLPHIN_WASM_JIT = m; }, mode);

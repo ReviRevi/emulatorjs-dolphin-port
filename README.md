@@ -66,6 +66,8 @@ port works, what was changed, and what's next.
 | `packaging/core.json` | EmulatorJS core metadata (extensions, default options) |
 | `scripts/` | setup / build / local server / headless browser smoke test |
 | `test-content/colorbars/` | Tiny bare-metal GameCube test program (clang PowerPC) |
+| `test-content/cpubench/` | Integer CPU benchmark (green = correct, binary counter = iterations) |
+| `test-content/fpbench/` | FP / paired-single benchmark; checksum must match with the JIT on and off |
 | `dist/` | Ready-to-serve test site with prebuilt core |
 
 ## License

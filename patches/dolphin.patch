@@ -1,3 +1,27 @@
+diff --git a/Externals/FFmpeg-bin b/Externals/FFmpeg-bin
+--- a/Externals/FFmpeg-bin
++++ b/Externals/FFmpeg-bin
+@@ -1 +1 @@
+-Subproject commit 9bc087fbca36ce5a85eb4fd73f0c73813593e5a2
++Subproject commit 9bc087fbca36ce5a85eb4fd73f0c73813593e5a2-dirty
+diff --git a/Externals/Qt b/Externals/Qt
+--- a/Externals/Qt
++++ b/Externals/Qt
+@@ -1 +1 @@
+-Subproject commit 306289108d29a4b31a5460f7b55d28fde7b96d1b
++Subproject commit 306289108d29a4b31a5460f7b55d28fde7b96d1b-dirty
+diff --git a/Externals/SFML/SFML b/Externals/SFML/SFML
+--- a/Externals/SFML/SFML
++++ b/Externals/SFML/SFML
+@@ -1 +1 @@
+-Subproject commit 0fa201c969e48ecc253581c5841ce73f44d42f49
++Subproject commit 0fa201c969e48ecc253581c5841ce73f44d42f49-dirty
+diff --git a/Externals/libadrenotools b/Externals/libadrenotools
+--- a/Externals/libadrenotools
++++ b/Externals/libadrenotools
+@@ -1 +1 @@
+-Subproject commit 8fae8ce254dfc1344527e05301e43f37dea2df80
++Subproject commit 8fae8ce254dfc1344527e05301e43f37dea2df80-dirty
 diff --git a/Externals/libusb/CMakeLists.txt b/Externals/libusb/CMakeLists.txt
 index 39c2960..d95d49f 100644
 --- a/Externals/libusb/CMakeLists.txt
@@ -332,10 +356,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..f58a070
+index 0000000..667ddb6
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,1452 @@
+@@ -0,0 +1,2446 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -422,6 +446,13 @@ index 0000000..f58a070
 +  return Module["__wasmJitTail"];
 +});
 +
++// Debugging aid: globalThis.DOLPHIN_WASM_JIT_DISABLE is a bitmask of
++// instruction groups to leave to the Interpreter (see WasmJitGroup).
++EM_JS(int, dolphin_wasm_jit_disabled_groups, (), {
++  var m = globalThis["DOLPHIN_WASM_JIT_DISABLE"];
++  return typeof m === "number" ? m : 0;
++});
++
 +// Statistics for tuning: which instructions fell back to the Interpreter.
 +EM_JS(void, dolphin_wasm_jit_note_fallback, (const char* name), {
 +  var s = Module["wasmJitFallbacks"] || (Module["wasmJitFallbacks"] = {});
@@ -450,10 +481,22 @@ index 0000000..f58a070
 +  L_HOST = 4,  // host address of the access
 +  L_T = 5,     // scratch
 +  L_V = 6,     // result value
-+  L_GPR0 = 7,  // r0..r31 cached in locals (Emitter::PushGPR / SetGPR)
-+  L_I32_COUNT = 7 + 32,
++  L_V2 = 7,    // second value (psq_st's ps1); never touched by Translate
++  L_GPR0 = 8,  // r0..r31 cached in locals (Emitter::PushGPR / SetGPR)
++  L_I32_COUNT = 8 + 32,
 +  L_X = L_I32_COUNT,  // i64 scratch
++  L_X2,               // i64 scratch
++  L_I64_END,
++  L_F0 = L_I64_END,   // f64 scratch
++  L_F1,
++  L_F2,
++  L_F3,
++  L_F4,
++  L_F5,
++  L_F64_END,
 +};
++constexpr u32 L_I64_COUNT = L_I64_END - L_X;
++constexpr u32 L_F64_COUNT = L_F64_END - L_F0;
 +
 +// Everything the inline code needs to know about the emulated machine. The
 +// addresses are fixed for the lifetime of the emulation (and blocks are
@@ -466,6 +509,7 @@ index 0000000..f58a070
 +  u32 msr;          // offsetof(msr)
 +  u32 xer_ca;       // offsetof(xer_ca)
 +  u32 xer_so_ov;    // offsetof(xer_so_ov)
++  u32 xer_stringctrl;  // offsetof(xer_stringctrl)
 +  u32 dcache;       // offsetof(m_enable_dcache)
 +  u32 cr_table;     // &ConditionRegister::s_crTable
 +  u32 dbat;         // &MMU::m_dbat_table
@@ -478,6 +522,8 @@ index 0000000..f58a070
 +  u32 spr;          // offsetof(spr)
 +  u32 downcount;    // offsetof(downcount)
 +  u32 feature_flags;  // offsetof(feature_flags)
++  u32 ps;           // offsetof(ps): paired singles, {u64 ps0, ps1} as double bits
++  u32 fpscr;        // offsetof(fpscr)
 +  bool dr;          // the block runs with MSR.DR set (blocks are per MSR.DR/IR,
 +                    // and instructions that change the MSR end the block)
 +};
@@ -683,6 +729,254 @@ index 0000000..f58a070
 +    c.I32Store(m.npc);
 +  }
 +
++
++  // ---- floating point ----
++  // Paired-single registers stay in PowerPCState (not cached in locals).
++  u32 PSOff(u32 r, u32 half) const { return m.ps + 16 * r + 8 * half; }
++  void PushPS(u32 r, u32 half)  // as f64
++  {
++    c.I32ConstU(m.ppc);
++    c.F64Load(PSOff(r, half));
++  }
++  void PushPSBits(u32 r, u32 half)  // as i64
++  {
++    c.I32ConstU(m.ppc);
++    c.I64Load(PSOff(r, half));
++  }
++  void StorePSFromLocal(u32 r, u32 half, u32 local_f64)
++  {
++    c.I32ConstU(m.ppc);
++    c.LocalGet(local_f64);
++    c.F64Store(PSOff(r, half));
++  }
++  void StorePSBitsFromLocal(u32 r, u32 half, u32 local_i64)
++  {
++    c.I32ConstU(m.ppc);
++    c.LocalGet(local_i64);
++    c.I64Store(PSOff(r, half));
++  }
++  // br_if `depth` if local f64 is NaN: NaNs and their FPSCR side effects are
++  // left to the Interpreter.
++  void BrIfNaN(u32 local_f64, u32 depth)
++  {
++    c.LocalGet(local_f64);
++    c.LocalGet(local_f64);
++    c.F64Ne();
++    c.BrIf(depth);
++  }
++  void PushFPSCRBit(u32 mask)
++  {
++    c.I32ConstU(m.ppc);
++    c.I32Load(m.fpscr);
++    c.I32ConstU(mask);
++    c.I32And();
++  }
++  // Force25Bit (Interpreter_FPUtils.h), normal-number path: round the
++  // mantissa to 25 bits. Pushes the result. (The subnormal-double path is
++  // not reproduced; GameCube values never get there.)
++  void Force25Bit(u32 local_f64)
++  {
++    c.LocalGet(local_f64);
++    c.I64ReinterpretF64();
++    c.LocalTee(L_X);
++    c.I64Const(static_cast<s64>(0xFFFFFFFFF8000000ULL));
++    c.I64And();
++    c.LocalGet(L_X);
++    c.I64Const(0x8000000);
++    c.I64And();
++    c.I64Add();
++    c.F64ReinterpretI64();
++  }
++  // ForceSingle (Interpreter_FPUtils.h): round to single and back, with the
++  // FPSCR.NI flush. local -> stack (f64).
++  void ForceSingle(u32 local_f64)
++  {
++    // flushed: sign only (selected when NI && |x| < smallest normal single)
++    c.LocalGet(local_f64);
++    c.I64ReinterpretF64();
++    c.I64Const(static_cast<s64>(0x8000000000000000ULL));
++    c.I64And();
++    c.F64ReinterpretI64();
++    // normal conversion
++    c.LocalGet(local_f64);
++    c.F32DemoteF64();
++    c.F64PromoteF32();
++    // NI && (bits & ~sign) < 0x3810000000000000
++    PushFPSCRBit(1u << 2);  // NI
++    c.I32Const(0);
++    c.I32Ne();
++    c.LocalGet(local_f64);
++    c.I64ReinterpretF64();
++    c.I64Const(0x7FFFFFFFFFFFFFFFLL);
++    c.I64And();
++    c.I64Const(0x3810000000000000LL);
++    c.I64LtU();
++    c.I32And();
++    c.Select();
++  }
++  // ForceDouble: flush subnormal doubles to zero when FPSCR.NI. local -> stack.
++  void ForceDouble(u32 local_f64)
++  {
++    c.LocalGet(local_f64);
++    c.I64ReinterpretF64();
++    c.I64Const(static_cast<s64>(0x8000000000000000ULL));
++    c.I64And();
++    c.F64ReinterpretI64();
++    c.LocalGet(local_f64);
++    PushFPSCRBit(1u << 2);
++    c.I32Const(0);
++    c.I32Ne();
++    // exponent == 0 && fraction != 0
++    c.LocalGet(local_f64);
++    c.I64ReinterpretF64();
++    c.I64Const(0x7FF0000000000000LL);
++    c.I64And();
++    c.I64Eqz();
++    c.I32And();
++    c.LocalGet(local_f64);
++    c.I64ReinterpretF64();
++    c.I64Const(0x000FFFFFFFFFFFFFLL);
++    c.I64And();
++    c.I64Const(0);
++    c.I64Ne();
++    c.I32And();
++    c.Select();
++  }
++  // ConvertToDouble (Interpreter_FPUtils.h) of the single in local i32 `v`
++  // -> stack (i64 bits).
++  void ConvertToDouble(u32 v)
++  {
++    // e = (v >> 23) & 0xff; subnormal (e == 0 && frac != 0): exact promote
++    c.LocalGet(v);
++    c.I32ConstU(0x7f800000);
++    c.I32And();
++    c.I32Eqz();
++    c.LocalGet(v);
++    c.I32ConstU(0x007fffff);
++    c.I32And();
++    c.I32Const(0);
++    c.I32Ne();
++    c.I32And();
++    c.If(WasmJit::I64);
++    {
++      c.LocalGet(v);
++      c.F32ReinterpretI32();
++      c.F64PromoteF32();
++      c.I64ReinterpretF64();
++    }
++    c.Else();
++    {
++      // ((x & 0xc0000000) << 32) | ((x & 0x3fffffff) << 29) | z
++      c.LocalGet(v);
++      c.I64ExtendI32U();
++      c.LocalTee(L_X2);
++      c.I64Const(0xc0000000LL);
++      c.I64And();
++      c.I64Const(32);
++      c.I64Shl();
++      c.LocalGet(L_X2);
++      c.I64Const(0x3fffffffLL);
++      c.I64And();
++      c.I64Const(29);
++      c.I64Shl();
++      c.I64Or();
++      // z = 0x3800000000000000 if e == 255 || (e != 0 && !(x & 0x40000000))
++      c.I64Const(0x3800000000000000LL);
++      c.I64Const(0);
++      c.LocalGet(v);
++      c.I32ConstU(0x7f800000);
++      c.I32And();
++      c.LocalTee(L_T);
++      c.I32ConstU(0x7f800000);
++      c.I32Eq();
++      c.LocalGet(L_T);
++      c.I32Const(0);
++      c.I32Ne();
++      c.LocalGet(v);
++      c.I32ConstU(0x40000000);
++      c.I32And();
++      c.I32Eqz();
++      c.I32And();
++      c.I32Or();
++      c.Select();
++      c.I64Or();
++    }
++    c.End();
++  }
++  // Single from double bits in local i64 `x`, the stfs way (ConvertToSingle):
++  // pushes the u32, or branches to `depth` for the denormal-result case.
++  // With ftz (psq_st: ConvertToSingleFTZ) that case becomes the sign instead.
++  void ConvertToSingle(u32 x, bool ftz, u32 depth)
++  {
++    // exp = (x >> 52) & 0x7ff; simple path when exp > 896 || exp < 874 || |x| == 0
++    c.LocalGet(x);
++    c.I64Const(52);
++    c.I64ShrU();
++    c.I32WrapI64();
++    c.I32ConstU(0x7ff);
++    c.I32And();
++    c.LocalTee(L_T);
++    c.I32ConstU(896);
++    c.I32LeU();
++    c.LocalGet(L_T);
++    c.I32ConstU(ftz ? 0 : 874);
++    c.I32GeU();
++    c.I32And();
++    c.LocalGet(x);
++    c.I64Const(0x7FFFFFFFFFFFFFFFLL);
++    c.I64And();
++    c.I64Const(0);
++    c.I64Ne();
++    c.I32And();
++    if (ftz)
++    {
++      c.If(WasmJit::I32);
++      c.LocalGet(x);
++      c.I64Const(32);
++      c.I64ShrU();
++      c.I32WrapI64();
++      c.I32ConstU(0x80000000);
++      c.I32And();
++      c.Else();
++    }
++    else
++    {
++      c.BrIf(depth);
++    }
++    // ((x >> 32) & 0xc0000000) | ((x >> 29) & 0x3fffffff)
++    c.LocalGet(x);
++    c.I64Const(32);
++    c.I64ShrU();
++    c.I32WrapI64();
++    c.I32ConstU(0xc0000000);
++    c.I32And();
++    c.LocalGet(x);
++    c.I64Const(29);
++    c.I64ShrU();
++    c.I32WrapI64();
++    c.I32ConstU(0x3fffffff);
++    c.I32And();
++    c.I32Or();
++    if (ftz)
++      c.End();
++  }
++  void Bswap64()  // i64 on the stack
++  {
++    c.LocalTee(L_X2);
++    c.I32WrapI64();
++    Bswap32();
++    c.I64ExtendI32U();
++    c.I64Const(32);
++    c.I64Shl();
++    c.LocalGet(L_X2);
++    c.I64Const(32);
++    c.I64ShrU();
++    c.I32WrapI64();
++    Bswap32();
++    c.I64ExtendI32U();
++    c.I64Or();
++  }
++
 +  void Bswap32()  // value on the stack
 +  {
 +    c.LocalTee(L_T);
@@ -884,6 +1178,614 @@ index 0000000..f58a070
 +
 +}  // namespace
 +
++
++// ---- floating point / paired singles ----
++// Matches the Interpreter's results bit for bit: anything that would produce
++// a NaN, plus the rare fused-multiply-add cases that need extra precision,
++// goes to the Interpreter (which also raises the FPSCR exceptions). FPSCR's
++// FPRF/FI/FR are not updated for arithmetic, like Dolphin's JITs (Jit64,
++// JitArm64) without the "FPRF" setting; Rc forms go to the Interpreter.
++enum WasmJitGroup : u32
++{
++  GROUP_FP_LOADSTORE = 1,  // lfs/lfd/stfs/stfd
++  GROUP_PSQ = 2,           // psq_l/psq_st
++  GROUP_FP_SINGLE = 4,     // opcode 59
++  GROUP_FP_DOUBLE = 8,     // opcode 63 arithmetic, frsp, fctiwz
++  GROUP_FP_MOVE = 16,      // fmr/fneg/fabs/fnabs/fsel, ps moves/merges/sel
++  GROUP_FP_COMPARE = 32,   // fcmpu/fcmpo/ps_cmp*
++  GROUP_PS_ARITH = 64,     // ps arithmetic
++  GROUP_INTEGER = 128,     // everything outside EmitInlineFP
++};
++static u32 s_disabled_groups = 0;
++static bool Enabled(u32 group)
++{
++  return (s_disabled_groups & group) == 0;
++}
++
++static bool EmitInlineFP(Emitter& e, UGeckoInstruction inst, bool& handled,
++                         const std::function<void()>& fallback)
++{
++  using namespace WasmJit;
++  WasmJit::CodeWriter& c = e.c;
++  handled = true;
++
++  // block { block { body (br_if 0 = slow) ; br 1 } ; fallback } ;
++  auto with_fallback = [&](auto body, bool reads_gprs) {
++    c.Block();
++    c.Block();
++    body();
++    c.Br(1);
++    c.End();
++    if (reads_gprs)
++      e.Flush(true);
++    fallback();
++    c.End();
++    return true;
++  };
++
++  // Raw result of a single-precision op on halves (ha of a, hb of b/c)
++  // into `dst` (f64 local); branches to 0 on cases left to the Interpreter.
++  enum class Op { Add, Sub, Mul, Div, Madd, Msub };
++  auto single_raw = [&](Op op, u32 fa, u32 ha, u32 fb, u32 hb, u32 fc, u32 hc, u32 dst) {
++    switch (op)
++    {
++    case Op::Add:
++    case Op::Sub:
++    case Op::Div:
++      e.PushPS(fa, ha);
++      e.PushPS(fb, hb);
++      op == Op::Add ? c.F64Add() : op == Op::Sub ? c.F64Sub() : c.F64Div();
++      c.LocalSet(dst);
++      break;
++    case Op::Mul:
++      e.PushPS(fc, hc);
++      c.LocalSet(L_F5);
++      e.PushPS(fa, ha);
++      e.Force25Bit(L_F5);
++      c.F64Mul();
++      c.LocalSet(dst);
++      break;
++    case Op::Madd:
++    case Op::Msub:
++      // NI_madd_msub<single>: fma(a, Force25Bit(c), +-b), with a tie fix-up.
++      // a * Force25Bit(c) is exact in a double when a has at most 28
++      // significant bits (always, for single-precision values), and then
++      // a * c + b rounds once, like the fma. Otherwise: Interpreter.
++      e.PushPSBits(fa, ha);
++      c.I64Const(0x1FFFFFF);
++      c.I64And();
++      c.I64Const(0);
++      c.I64Ne();
++      c.BrIf(0);
++      e.PushPS(fc, hc);
++      c.LocalSet(L_F5);
++      e.PushPS(fa, ha);
++      e.Force25Bit(L_F5);
++      c.F64Mul();
++      e.PushPS(fb, hb);
++      op == Op::Madd ? c.F64Add() : c.F64Sub();
++      c.LocalTee(dst);
++      // the tie case the Interpreter corrects: (bits & 0x1fffffff) == 0x10000000
++      c.I64ReinterpretF64();
++      c.I64Const(0x1fffffff);
++      c.I64And();
++      c.I64Const(0x10000000);
++      c.I64Eq();
++      c.BrIf(0);
++      break;
++    }
++    e.BrIfNaN(dst, 0);
++  };
++  // dst = ForceSingle(src), negated for the nmadd/nmsub forms (src isn't NaN)
++  auto to_single = [&](u32 src, u32 dst, bool negate) {
++    e.ForceSingle(src);
++    if (negate)
++      c.F64Neg();
++    c.LocalSet(dst);
++  };
++
++  const u32 fd = inst.FD, fa = inst.FA, fb = inst.FB, fc = inst.FC;
++
++  // ---------------- loads / stores ----------------
++  enum class Mem { LFS, LFD, STFS, STFD, PSQ_L, PSQ_ST };
++  auto fpmem = [&](Mem kind, auto ea, bool update, bool w = false, u32 gqr = 0) {
++    if (!Enabled((kind == Mem::PSQ_L || kind == Mem::PSQ_ST) ? GROUP_PSQ : GROUP_FP_LOADSTORE))
++      return false;
++    const bool store = kind == Mem::STFS || kind == Mem::STFD || kind == Mem::PSQ_ST;
++    const u32 size = (kind == Mem::LFD || kind == Mem::STFD) ? 8 :
++                     ((kind == Mem::PSQ_L || kind == Mem::PSQ_ST) && !w) ? 8 : 4;
++    c.Block();  // $done
++    c.Block();  // $slow
++    ea();
++    c.LocalSet(L_EA);
++    if (kind == Mem::PSQ_L || kind == Mem::PSQ_ST)
++    {
++      // HID2.LSQE must be set, and the GQR type must be float
++      e.PushSPR(SPR_HID2);
++      c.I32ConstU(0x80000000);
++      c.I32And();
++      c.I32Eqz();
++      c.BrIf(0);
++      e.PushSPR(SPR_GQR0 + gqr);
++      if (kind == Mem::PSQ_L)
++      {
++        c.I32Const(16);
++        c.I32ShrU();
++      }
++      c.I32Const(7);
++      c.I32And();
++      c.BrIf(0);
++    }
++    else
++    {
++      // lfs/lfd/stfs/stfd: misaligned -> alignment exception (Interpreter)
++      c.LocalGet(L_EA);
++      c.I32Const(3);
++      c.I32And();
++      c.BrIf(0);
++    }
++    // store values, before translating (stfs may need the Interpreter)
++    if (kind == Mem::STFS)
++    {
++      e.PushPSBits(fd, 0);
++      c.LocalSet(L_X);
++      e.ConvertToSingle(L_X, false, 0);
++      c.LocalSet(L_V);
++    }
++    else if (kind == Mem::STFD)
++    {
++      e.PushPSBits(fd, 0);
++      c.LocalSet(L_X);
++    }
++    else if (kind == Mem::PSQ_ST)
++    {
++      e.PushPSBits(fd, 0);
++      c.LocalSet(L_X);
++      e.ConvertToSingle(L_X, true, 0);
++      c.LocalSet(L_V);
++      if (!w)
++      {
++        e.PushPSBits(fd, 1);
++        c.LocalSet(L_X);
++        e.ConvertToSingle(L_X, true, 0);
++        c.LocalSet(L_V2);
++      }
++    }
++    e.Translate(size, store, 0);
++    switch (kind)
++    {
++    case Mem::LFS:
++      c.LocalGet(L_HOST);
++      c.I32Load();
++      e.Bswap32();
++      c.LocalSet(L_V);
++      e.ConvertToDouble(L_V);
++      c.LocalSet(L_X);
++      e.StorePSBitsFromLocal(fd, 0, L_X);
++      e.StorePSBitsFromLocal(fd, 1, L_X);
++      break;
++    case Mem::LFD:
++      c.LocalGet(L_HOST);
++      c.I64Load();
++      e.Bswap64();
++      c.LocalSet(L_X);
++      e.StorePSBitsFromLocal(fd, 0, L_X);
++      break;
++    case Mem::PSQ_L:
++      c.LocalGet(L_HOST);
++      c.I32Load();
++      e.Bswap32();
++      c.LocalSet(L_V);
++      e.ConvertToDouble(L_V);
++      c.LocalSet(L_X);
++      if (w)
++      {
++        c.I64Const(0x3FF0000000000000LL);  // 1.0
++      }
++      else
++      {
++        c.LocalGet(L_HOST);
++        c.I32Load(4);
++        e.Bswap32();
++        c.LocalSet(L_V);
++        e.ConvertToDouble(L_V);
++      }
++      c.LocalSet(L_X2);
++      e.StorePSBitsFromLocal(fd, 0, L_X);
++      e.StorePSBitsFromLocal(fd, 1, L_X2);
++      break;
++    case Mem::STFS:
++      e.StoreHost(4, L_V);
++      break;
++    case Mem::STFD:
++      c.LocalGet(L_HOST);
++      c.LocalGet(L_X);
++      e.Bswap64();
++      c.I64Store();
++      break;
++    case Mem::PSQ_ST:
++      e.StoreHost(4, L_V);
++      if (!w)
++      {
++        c.LocalGet(L_HOST);
++        c.LocalGet(L_V2);
++        e.Bswap32();
++        c.I32Store(4);
++      }
++      break;
++    }
++    if (update)
++      e.SetGPRFromLocal(inst.RA, L_EA);
++    c.Br(1);
++    c.End();  // $slow
++    e.Flush(true);
++    fallback();
++    if (update)
++      e.Reload(inst.RA);
++    c.End();  // $done
++    if (update)
++    {
++      e.loaded |= 1u << inst.RA;
++      e.dirty |= 1u << inst.RA;
++    }
++    return true;
++  };
++  const u32 ra = inst.RA, rb = inst.RB;
++  auto ea_d = [&] { e.PushRAOrZero(ra); c.I32Const(inst.SIMM_16); c.I32Add(); };
++  auto ea_du = [&] { e.PushGPR(ra); c.I32Const(inst.SIMM_16); c.I32Add(); };
++  auto ea_x = [&] { e.PushRAOrZero(ra); e.PushGPR(rb); c.I32Add(); };
++  auto ea_xu = [&] { e.PushGPR(ra); e.PushGPR(rb); c.I32Add(); };
++  auto ea_q = [&] { e.PushRAOrZero(ra); c.I32Const(inst.SIMM_12); c.I32Add(); };
++  auto ea_qu = [&] { e.PushGPR(ra); c.I32Const(inst.SIMM_12); c.I32Add(); };
++
++  switch (inst.OPCD)
++  {
++  case 48: return fpmem(Mem::LFS, ea_d, false);
++  case 49: return fpmem(Mem::LFS, ea_du, true);
++  case 50: return fpmem(Mem::LFD, ea_d, false);
++  case 51: return fpmem(Mem::LFD, ea_du, true);
++  case 52: return fpmem(Mem::STFS, ea_d, false);
++  case 53: return fpmem(Mem::STFS, ea_du, true);
++  case 54: return fpmem(Mem::STFD, ea_d, false);
++  case 55: return fpmem(Mem::STFD, ea_du, true);
++  case 56: return fpmem(Mem::PSQ_L, ea_q, false, inst.W, inst.I);
++  case 57: return fpmem(Mem::PSQ_L, ea_qu, true, inst.W, inst.I);
++  case 60: return fpmem(Mem::PSQ_ST, ea_q, false, inst.W, inst.I);
++  case 61: return fpmem(Mem::PSQ_ST, ea_qu, true, inst.W, inst.I);
++  case 31:
++    switch (inst.SUBOP10)
++    {
++    case 535: return fpmem(Mem::LFS, ea_x, false);
++    case 567: return fpmem(Mem::LFS, ea_xu, true);
++    case 599: return fpmem(Mem::LFD, ea_x, false);
++    case 631: return fpmem(Mem::LFD, ea_xu, true);
++    case 663: return fpmem(Mem::STFS, ea_x, false);
++    case 695: return fpmem(Mem::STFS, ea_xu, true);
++    case 727: return fpmem(Mem::STFD, ea_x, false);
++    case 759: return fpmem(Mem::STFD, ea_xu, true);
++    default: handled = false; return false;
++    }
++  case 59:
++  case 63:
++  case 4:
++    break;
++  default:
++    handled = false;
++    return false;
++  }
++
++  if (inst.Rc)  // CR1 updates: Interpreter
++    return false;
++
++  // ---------------- compare helper ----------------
++  // CR field + FPSCR.FPCC from halves of a and b; NaNs -> Interpreter.
++  auto fcompare = [&](u32 ha, u32 hb) {
++    if (!Enabled(GROUP_FP_COMPARE))
++      return false;
++    return with_fallback(
++        [&] {
++          e.PushPS(fa, ha);
++          c.LocalSet(L_F0);
++          e.PushPS(fb, hb);
++          c.LocalSet(L_F1);
++          e.BrIfNaN(L_F0, 0);
++          e.BrIfNaN(L_F1, 0);
++          // code = LT*8 | GT*4 | EQ*2 (FPCC FL/FG/FE)
++          c.LocalGet(L_F0);
++          c.LocalGet(L_F1);
++          c.F64Lt();
++          c.I32Const(3);
++          c.I32Shl();
++          c.LocalGet(L_F0);
++          c.LocalGet(L_F1);
++          c.F64Gt();
++          c.I32Const(2);
++          c.I32Shl();
++          c.I32Or();
++          c.LocalGet(L_F0);
++          c.LocalGet(L_F1);
++          c.F64Eq();
++          c.I32Const(1);
++          c.I32Shl();
++          c.I32Or();
++          c.LocalSet(L_V);
++          // fpscr.FPRF = (FPRF & ~0xF) | code   (FPRF is bits 12..16)
++          c.I32ConstU(e.m.ppc);
++          c.I32ConstU(e.m.ppc);
++          c.I32Load(e.m.fpscr);
++          c.I32ConstU(~(0xFu << 12));
++          c.I32And();
++          c.LocalGet(L_V);
++          c.I32Const(12);
++          c.I32Shl();
++          c.I32Or();
++          c.I32Store(e.m.fpscr);
++          // cr.fields[crfd] = s_crTable[code]
++          c.I32ConstU(e.m.ppc);
++          c.LocalGet(L_V);
++          c.I32Const(3);
++          c.I32Shl();
++          c.I32ConstU(e.m.cr_table);
++          c.I32Add();
++          c.I64Load();
++          c.I64Store(e.m.cr + 8 * inst.CRFD);
++        },
++        false);
++  };
++  // bit ops on ps0 (and ps1): dst = f(src)
++  auto bits_op = [&](bool both, auto f) {
++    if (!Enabled(GROUP_FP_MOVE))
++      return false;
++    for (u32 h = 0; h < (both ? 2u : 1u); h++)
++    {
++      e.PushPSBits(fb, h);
++      f();
++      c.LocalSet(h ? L_X2 : L_X);
++    }
++    for (u32 h = 0; h < (both ? 2u : 1u); h++)
++      e.StorePSBitsFromLocal(fd, h, h ? L_X2 : L_X);
++    return true;
++  };
++  constexpr s64 SIGN = static_cast<s64>(0x8000000000000000ULL);
++
++  if (inst.OPCD == 59)
++  {
++    if (!Enabled(GROUP_FP_SINGLE))
++      return false;
++    Op op;
++    bool neg = false;
++    switch (inst.SUBOP5)
++    {
++    case 18: op = Op::Div; break;
++    case 20: op = Op::Sub; break;
++    case 21: op = Op::Add; break;
++    case 25: op = Op::Mul; break;
++    case 28: op = Op::Msub; break;
++    case 29: op = Op::Madd; break;
++    case 30: op = Op::Msub; neg = true; break;
++    case 31: op = Op::Madd; neg = true; break;
++    default: return false;  // fres
++    }
++    return with_fallback(
++        [&] {
++          single_raw(op, fa, 0, fb, 0, fc, 0, L_F0);
++          to_single(L_F0, L_F2, neg);
++          e.StorePSFromLocal(fd, 0, L_F2);
++          e.StorePSFromLocal(fd, 1, L_F2);
++        },
++        false);
++  }
++
++  if (inst.OPCD == 63)
++  {
++    if (inst.SUBOP5 == 23 && !Enabled(GROUP_FP_MOVE))
++      return false;
++    if (inst.SUBOP5 != 23 && !Enabled(GROUP_FP_DOUBLE) &&
++        !(inst.SUBOP10 == 0 || inst.SUBOP10 == 32 || inst.SUBOP10 == 40 || inst.SUBOP10 == 72 ||
++          inst.SUBOP10 == 136 || inst.SUBOP10 == 264))
++      return false;
++    switch (inst.SUBOP5)
++    {
++    case 18:  // fdiv
++    case 20:  // fsub
++    case 21:  // fadd
++    case 25:  // fmul
++      return with_fallback(
++          [&] {
++            e.PushPS(fa, 0);
++            e.PushPS(inst.SUBOP5 == 25 ? fc : fb, 0);
++            switch (inst.SUBOP5)
++            {
++            case 18: c.F64Div(); break;
++            case 20: c.F64Sub(); break;
++            case 21: c.F64Add(); break;
++            default: c.F64Mul(); break;
++            }
++            c.LocalSet(L_F0);
++            e.BrIfNaN(L_F0, 0);
++            e.ForceDouble(L_F0);
++            c.LocalSet(L_F2);
++            e.StorePSFromLocal(fd, 0, L_F2);
++          },
++          false);
++    case 23:  // fsel: ps0 = a >= -0.0 ? c : b
++      e.PushPSBits(fc, 0);
++      e.PushPSBits(fb, 0);
++      e.PushPS(fa, 0);
++      c.F64Const(-0.0);
++      c.F64Ge();
++      c.Select();
++      c.LocalSet(L_X);
++      e.StorePSBitsFromLocal(fd, 0, L_X);
++      return true;
++    default:
++      break;
++    }
++    switch (inst.SUBOP10)
++    {
++    case 0:   // fcmpu
++    case 32:  // fcmpo
++      return fcompare(0, 0);
++    case 12:  // frsp
++      return with_fallback(
++          [&] {
++            e.PushPS(fb, 0);
++            c.LocalSet(L_F0);
++            e.BrIfNaN(L_F0, 0);
++            to_single(L_F0, L_F2, false);
++            e.StorePSFromLocal(fd, 0, L_F2);
++            e.StorePSFromLocal(fd, 1, L_F2);
++          },
++          false);
++    case 15:  // fctiwz
++      return with_fallback(
++          [&] {
++            // in range (and not NaN): -2^31 <= b < 2^31, else Interpreter
++            e.PushPS(fb, 0);
++            c.LocalTee(L_F0);
++            c.F64Const(-2147483648.0);
++            c.F64Ge();
++            c.LocalGet(L_F0);
++            c.F64Const(2147483648.0);
++            c.F64Lt();
++            c.I32And();
++            c.I32Eqz();
++            c.BrIf(0);
++            // ps0 = 0xfff8000000000000 | u32(trunc(b)), | 0x100000000 for -0 results
++            c.LocalGet(L_F0);
++            c.I32TruncF64S();
++            c.LocalTee(L_V);
++            c.I64ExtendI32U();
++            c.I64Const(static_cast<s64>(0xfff8000000000000ULL));
++            c.I64Or();
++            c.I64Const(0x100000000LL);
++            c.I64Const(0);
++            c.LocalGet(L_V);
++            c.I32Eqz();
++            c.LocalGet(L_F0);
++            c.I64ReinterpretF64();
++            c.I64Const(0);
++            c.I64LtS();
++            c.I32And();
++            c.Select();
++            c.I64Or();
++            c.LocalSet(L_X);
++            e.StorePSBitsFromLocal(fd, 0, L_X);
++          },
++          false);
++    case 40:   // fneg
++      return bits_op(false, [&] { c.I64Const(SIGN); c.I64Xor(); });
++    case 72:   // fmr
++      return bits_op(false, [] {});
++    case 136:  // fnabs
++      return bits_op(false, [&] { c.I64Const(SIGN); c.I64Or(); });
++    case 264:  // fabs
++      return bits_op(false, [&] { c.I64Const(~SIGN); c.I64And(); });
++    default:
++      return false;
++    }
++  }
++
++  // ---------------- opcode 4: paired singles ----------------
++  switch (inst.SUBOP10)
++  {
++  case 0:   return fcompare(0, 0);  // ps_cmpu0
++  case 32:  return fcompare(0, 0);  // ps_cmpo0
++  case 64:  return fcompare(1, 1);  // ps_cmpu1
++  case 96:  return fcompare(1, 1);  // ps_cmpo1
++  case 40:  return bits_op(true, [&] { c.I64Const(SIGN); c.I64Xor(); });   // ps_neg
++  case 72:  return bits_op(true, [] {});                                    // ps_mr
++  case 136: return bits_op(true, [&] { c.I64Const(SIGN); c.I64Or(); });    // ps_nabs
++  case 264: return bits_op(true, [&] { c.I64Const(~SIGN); c.I64And(); });  // ps_abs
++  case 528:  // ps_merge00
++  case 560:  // ps_merge01
++  case 592:  // ps_merge10
++  case 624:  // ps_merge11
++  {
++    if (!Enabled(GROUP_FP_MOVE))
++      return false;
++    const u32 h0 = (inst.SUBOP10 == 592 || inst.SUBOP10 == 624) ? 1 : 0;  // from a
++    const u32 h1 = (inst.SUBOP10 == 560 || inst.SUBOP10 == 624) ? 1 : 0;  // from b
++    e.PushPSBits(fa, h0);
++    c.LocalSet(L_X);
++    e.PushPSBits(fb, h1);
++    c.LocalSet(L_X2);
++    e.StorePSBitsFromLocal(fd, 0, L_X);
++    e.StorePSBitsFromLocal(fd, 1, L_X2);
++    return true;
++  }
++  default:
++    break;
++  }
++
++  auto paired = [&](Op op, bool neg, u32 c_half0, u32 c_half1) {
++    if (!Enabled(GROUP_PS_ARITH))
++      return false;
++    return with_fallback(
++        [&] {
++          single_raw(op, fa, 0, fb, 0, fc, c_half0, L_F0);
++          single_raw(op, fa, 1, fb, 1, fc, c_half1, L_F1);
++          to_single(L_F0, L_F2, neg);
++          to_single(L_F1, L_F3, neg);
++          e.StorePSFromLocal(fd, 0, L_F2);
++          e.StorePSFromLocal(fd, 1, L_F3);
++        },
++        false);
++  };
++  switch (inst.SUBOP5)
++  {
++  case 10:  // ps_sum0: ps0 = a0 + b1, ps1 = c1
++  case 11:  // ps_sum1: ps0 = c0, ps1 = a0 + b1
++  {
++    if (!Enabled(GROUP_PS_ARITH))
++      return false;
++    const bool sum0 = inst.SUBOP5 == 10;
++    return with_fallback(
++        [&] {
++          single_raw(Op::Add, fa, 0, fb, 1, 0, 0, L_F0);
++          e.PushPS(fc, sum0 ? 1 : 0);
++          c.LocalSet(L_F1);
++          e.BrIfNaN(L_F1, 0);
++          to_single(L_F0, L_F2, false);
++          to_single(L_F1, L_F3, false);
++          e.StorePSFromLocal(fd, sum0 ? 0 : 1, L_F2);
++          e.StorePSFromLocal(fd, sum0 ? 1 : 0, L_F3);
++        },
++        false);
++  }
++  case 12: return paired(Op::Mul, false, 0, 0);   // ps_muls0
++  case 13: return paired(Op::Mul, false, 1, 1);   // ps_muls1
++  case 14: return paired(Op::Madd, false, 0, 0);  // ps_madds0
++  case 15: return paired(Op::Madd, false, 1, 1);  // ps_madds1
++  case 18: return paired(Op::Div, false, 0, 1);   // ps_div
++  case 20: return paired(Op::Sub, false, 0, 1);   // ps_sub
++  case 21: return paired(Op::Add, false, 0, 1);   // ps_add
++  case 23:  // ps_sel
++    if (!Enabled(GROUP_FP_MOVE))
++      return false;
++    for (u32 h = 0; h < 2; h++)
++    {
++      e.PushPSBits(fc, h);
++      e.PushPSBits(fb, h);
++      e.PushPS(fa, h);
++      c.F64Const(-0.0);
++      c.F64Ge();
++      c.Select();
++      c.LocalSet(h ? L_X2 : L_X);
++    }
++    e.StorePSBitsFromLocal(fd, 0, L_X);
++    e.StorePSBitsFromLocal(fd, 1, L_X2);
++    return true;
++  case 25: return paired(Op::Mul, false, 0, 1);   // ps_mul
++  case 28: return paired(Op::Msub, false, 0, 1);  // ps_msub
++  case 29: return paired(Op::Madd, false, 0, 1);  // ps_madd
++  case 30: return paired(Op::Msub, true, 0, 1);   // ps_nmsub
++  case 31: return paired(Op::Madd, true, 0, 1);   // ps_nmadd
++  default:
++    return false;  // ps_res, ps_rsqrte, quantized indexed loads, dcbz_l, ...
++  }
++}
++
 +// Emits inline WebAssembly for one instruction, with `fallback` (a call to
 +// the Interpreter's version of it) for the cases the inline code doesn't
 +// handle. Returns false if the instruction isn't handled inline at all.
@@ -977,6 +1879,17 @@ index 0000000..f58a070
 +      return true;
 +    }
 +  }
++
++  if (inst.OPCD == 4 || inst.OPCD == 59 || inst.OPCD == 63 || (inst.OPCD >= 48 && inst.OPCD <= 61) ||
++      (inst.OPCD == 31 && inst.SUBOP10 >= 535 && inst.SUBOP10 <= 759))
++  {
++    bool handled;
++    const bool ok = EmitInlineFP(e, inst, handled, fallback);
++    if (handled)
++      return ok;
++  }
++  if (!Enabled(GROUP_INTEGER) && inst.OPCD != 16 && inst.OPCD != 18 && inst.OPCD != 19)
++    return false;
 +
 +  // Memory access with fast path + interpreter fallback.
 +  //   ea():     pushes the effective address
@@ -1348,6 +2261,107 @@ index 0000000..f58a070
 +      e.UpdateCR0(Local::L_V);
 +    return true;
 +  }
++  case 339:  // mfspr
++  case 467:  // mtspr
++  {
++    const u32 spr = inst.SPR;
++    const u32 index = xo == 339 ? (((spr & 0x1F) << 5) + ((spr >> 5) & 0x1F)) :
++                                  ((inst.SPRU << 5) | (inst.SPRL & 0x1F));
++    const bool user = index == SPR_LR || index == SPR_CTR || index == SPR_XER;
++    const bool plain = user || (index >= SPR_GQR0 && index < SPR_GQR0 + 8) ||
++                       (index >= SPR_SPRG0 && index < SPR_SPRG0 + 4);
++    if (!plain)
++      return false;  // side effects: Interpreter
++    // Supervisor-only SPRs: in user mode (MSR.PR) the Interpreter raises the
++    // program exception.
++    c.Block();
++    c.Block();
++    e.Use(rd);
++    if (!user)
++    {
++      c.I32ConstU(e.m.ppc);
++      c.I32Load(e.m.msr);
++      c.I32Const(1 << 14);  // MSR.PR
++      c.I32And();
++      c.BrIf(0);
++    }
++    if (xo == 339)
++    {
++      if (index == SPR_XER)
++      {
++        // GetXER(): stringctrl | ca << 29 | so_ov << 30, also stored in spr[XER]
++        c.I32ConstU(e.m.ppc);
++        c.I32Load16U(e.m.xer_stringctrl);
++        c.I32ConstU(e.m.ppc);
++        c.I32Load8U(e.m.xer_ca);
++        c.I32Const(XER_CA_SHIFT);
++        c.I32Shl();
++        c.I32Or();
++        c.I32ConstU(e.m.ppc);
++        c.I32Load8U(e.m.xer_so_ov);
++        c.I32Const(XER_OV_SHIFT);
++        c.I32Shl();
++        c.I32Or();
++        c.LocalSet(L_V);
++        e.SetSPR(index, [&] { c.LocalGet(L_V); });
++        e.SetGPRFromLocal(rd, L_V);
++      }
++      else
++      {
++        e.SetGPR(rd, [&] { e.PushSPR(index); });
++      }
++    }
++    else
++    {
++      e.PushGPR(rd);
++      c.LocalSet(L_V);
++      e.SetSPR(index, [&] { c.LocalGet(L_V); });
++      if (index == SPR_XER)
++      {
++        // SetXER: stringctrl = BYTE_COUNT + (BYTE_CMP << 8); ca; so_ov = (SO << 1) + OV
++        c.I32ConstU(e.m.ppc);
++        c.LocalGet(L_V);
++        c.I32Const(0x7f);
++        c.I32And();
++        c.LocalGet(L_V);
++        c.I32Const(8);
++        c.I32ShrU();
++        c.I32Const(0xff);
++        c.I32And();
++        c.I32Const(8);
++        c.I32Shl();
++        c.I32Add();
++        c.I32Store16(e.m.xer_stringctrl);
++        c.I32ConstU(e.m.ppc);
++        c.LocalGet(L_V);
++        c.I32Const(XER_CA_SHIFT);
++        c.I32ShrU();
++        c.I32Const(1);
++        c.I32And();
++        c.I32Store8(e.m.xer_ca);
++        c.I32ConstU(e.m.ppc);
++        c.LocalGet(L_V);
++        c.I32Const(XER_OV_SHIFT);
++        c.I32ShrU();
++        c.I32Const(3);
++        c.I32And();
++        c.I32Store8(e.m.xer_so_ov);
++      }
++    }
++    c.Br(1);
++    c.End();
++    e.Flush(true);
++    fallback();
++    if (xo == 339)
++      e.Reload(rd);
++    c.End();
++    if (xo == 339)
++    {
++      e.loaded |= 1u << rd;
++      e.dirty |= 1u << rd;
++    }
++    return true;
++  }
 +  case 922:  // extsh
 +  case 954:  // extsb
 +    return binop(ra, [&] {
@@ -1528,6 +2542,7 @@ index 0000000..f58a070
 +{
 +  using namespace WasmJit;
 +  const int mode = dolphin_wasm_jit_mode();
++  s_disabled_groups = static_cast<u32>(dolphin_wasm_jit_disabled_groups());
 +  if (mode <= 0)
 +  {
 +    entry.calls = WASM_JIT_NEVER;
@@ -1550,6 +2565,7 @@ index 0000000..f58a070
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, msr)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_ca)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_so_ov)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_stringctrl)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, m_enable_dcache)),
 +      static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data())),
 +      static_cast<u32>(reinterpret_cast<uintptr_t>(m_system.GetMMU().GetDBATTable().data())),
@@ -1562,6 +2578,8 @@ index 0000000..f58a070
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, spr)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, feature_flags)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, ps)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, fpscr)),
 +      (block.feature_flags & FEATURE_FLAG_MSR_DR) != 0,
 +  };
 +  const bool branch_watch = m_system.GetPowerPC().GetBranchWatch().GetRecordingActive();
@@ -1777,7 +2795,7 @@ index 0000000..f58a070
 +  c.End();        // loop
 +  c.I32Const(0);  // not reached: every block ends in EndBlock
 +  const std::vector<u8> module =
-+      BuildModule({{L_I32_COUNT, I32}, {1, I64}}, c.bytes);
++      BuildModule({{L_I32_COUNT, I32}, {L_I64_COUNT, I64}, {L_F64_COUNT, F64}}, c.bytes);
 +  const int fn = dolphin_wasm_jit_install(module.data(), static_cast<int>(module.size()));
 +  if (fn <= 0)
 +  {
@@ -1804,10 +2822,10 @@ index 6653297..95ceb68 100644
  #undef LOOKUP_KV
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
 new file mode 100644
-index 0000000..68edaed
+index 0000000..3b81833
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,312 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -1987,7 +3005,38 @@ index 0000000..68edaed
 +  void I64ShrS() { Byte(0x87); }
 +  void I64ShrU() { Byte(0x88); }
 +
++  void F64Eq() { Byte(0x61); }
++  void F64Ne() { Byte(0x62); }
++  void F64Lt() { Byte(0x63); }
++  void F64Gt() { Byte(0x64); }
++  void F64Le() { Byte(0x65); }
++  void F64Ge() { Byte(0x66); }
++  void F64Abs() { Byte(0x99); }
++  void F64Neg() { Byte(0x9a); }
++  void F64Trunc() { Byte(0x9d); }
++  void F64Add() { Byte(0xa0); }
++  void F64Sub() { Byte(0xa1); }
++  void F64Mul() { Byte(0xa2); }
++  void F64Div() { Byte(0xa3); }
++  void F64Const(double v)
++  {
++    Byte(0x44);
++    u64 bits;
++    std::memcpy(&bits, &v, 8);
++    for (int i = 0; i < 8; i++)
++      Byte(static_cast<u8>(bits >> (8 * i)));
++  }
++  void I64LtU() { Byte(0x54); }
++  void I64Eq() { Byte(0x51); }
++  void I64Xor() { Byte(0x85); }
 +  void I32WrapI64() { Byte(0xa7); }
++  void I32TruncF64S() { Byte(0xaa); }
++  void F32DemoteF64() { Byte(0xb6); }
++  void F64PromoteF32() { Byte(0xbb); }
++  void I32ReinterpretF32() { Byte(0xbc); }
++  void I64ReinterpretF64() { Byte(0xbd); }
++  void F32ReinterpretI32() { Byte(0xbe); }
++  void F64ReinterpretI64() { Byte(0xbf); }
 +  void I64ExtendI32S() { Byte(0xac); }
 +  void I64ExtendI32U() { Byte(0xad); }
 +  void I32Extend8S() { Byte(0xc0); }
