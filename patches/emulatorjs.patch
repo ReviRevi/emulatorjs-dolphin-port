@@ -71,7 +71,7 @@ index 6d76007..fd3dd5a 100644
 -export const requiresWebGL2 = ["ppsspp", "azahar"];
 +export const requiresWebGL2 = ["ppsspp", "azahar", "dolphin"];
 diff --git a/data/src/emulator.js b/data/src/emulator.js
-index fce1457..f941daf 100644
+index fce1457..79dd24c 100644
 --- a/data/src/emulator.js
 +++ b/data/src/emulator.js
 @@ -867,6 +867,9 @@ class EmulatorJS {
@@ -84,3 +84,61 @@ index fce1457..f941daf 100644
      }
  
      /**
+@@ -1852,38 +1855,31 @@ class EmulatorJS {
+         return null;
+     }
+     getCoreSettings() {
+-        if (!window.localStorage || this.config.disableLocalStorage) {
+-            if (this.config.defaultOptions) {
+-                let rv = "";
+-                for (const k in this.config.defaultOptions) {
+-                    let value = isNaN(this.config.defaultOptions[k]) ? `"${this.config.defaultOptions[k]}"` : this.config.defaultOptions[k];
+-                    rv += `${k} = ${value}\n`;
+-                }
+-                return rv;
+-            }
+-            return "";
++        // Core options file contents. Later sources win: the core's own defaults
++        // (core.json), the settings stored for this game, EJS_defaultOptions,
++        // then EJS_coreOpts. (Upstream returned nothing on a game's first
++        // launch, so defaults and EJS_coreOpts only applied from the second.)
++        const merged = {};
++        const add = (o) => {
++            if (o && typeof o === "object") for (const k in o) merged[k] = o[k];
+         };
+-        let coreSpecific = localStorage.getItem(this.getLocalStorageKey());
+-        if (coreSpecific) {
++        add(this.defaultCoreOpts && this.defaultCoreOpts.settings);
++        if (window.localStorage && !this.config.disableLocalStorage) {
+             try {
+-                coreSpecific = JSON.parse(coreSpecific);
+-                if (!(coreSpecific.settings instanceof Object)) throw new Error("Not a JSON object");
+-                let rv = "";
+-                for (const k in coreSpecific.settings) {
+-                    let value = isNaN(coreSpecific.settings[k]) ? `"${coreSpecific.settings[k]}"` : coreSpecific.settings[k];
+-                    rv += `${k} = ${value}\n`;
+-                }
+-                for (const k in this.config.defaultOptions) {
+-                    if (rv.includes(k)) continue;
+-                    let value = isNaN(this.config.defaultOptions[k]) ? `"${this.config.defaultOptions[k]}"` : this.config.defaultOptions[k];
+-                    rv += `${k} = ${value}\n`;
+-                }
+-                return rv;
++                const coreSpecific = JSON.parse(localStorage.getItem(this.getLocalStorageKey()));
++                if (coreSpecific && coreSpecific.settings instanceof Object) add(coreSpecific.settings);
+             } catch(e) {
+                 console.warn("Could not load previous settings", e);
+             }
+         }
+-        return "";
++        add(this.config.defaultOptions);
++        add(this.config.coreOpts);
++        let rv = "";
++        for (const k in merged) {
++            const value = isNaN(merged[k]) ? `"${merged[k]}"` : merged[k];
++            rv += `${k} = ${value}\n`;
++        }
++        return rv;
+     }
+     loadSettings() {
+         if (!window.localStorage || this.config.disableLocalStorage) return;
