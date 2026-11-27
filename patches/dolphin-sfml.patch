@@ -1,0 +1,16 @@
+diff --git a/include/SFML/Config.hpp b/include/SFML/Config.hpp
+index 36a8b1a..c8c8da7 100644
+--- a/include/SFML/Config.hpp
++++ b/include/SFML/Config.hpp
+@@ -96,6 +96,11 @@
+ // NetBSD
+ #define SFML_SYSTEM_NETBSD
+ 
++#elif defined(__EMSCRIPTEN__)
++
++// Emscripten (POSIX-like)
++#define SFML_SYSTEM_LINUX
++
+ #else
+ 
+ // Unsupported UNIX system

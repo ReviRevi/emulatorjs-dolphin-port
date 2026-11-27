@@ -1,0 +1,86 @@
+diff --git a/data/src/GameManager.js b/data/src/GameManager.js
+index 0da9d6a..39bba2a 100644
+--- a/data/src/GameManager.js
++++ b/data/src/GameManager.js
+@@ -173,6 +173,10 @@ class EJS_GameManager {
+             (this.EJS.rewindEnabled ? "rewind_enable = true\n" : "") +
+             (this.EJS.rewindEnabled ? "rewind_granularity = 6\n" : "") +
+             "savefile_directory = \"/data/saves\"\n";
++        if (this.EJS.getCore() === "dolphin") {
++            // Dolphin looks for <system>/dolphin-emu/Sys (see loadDolphinAssets)
++            cfg += "system_directory = \"/home/web_user/retroarch/system\"\n";
++        }
+ 
+         if (this.EJS.retroarchOpts && Array.isArray(this.EJS.retroarchOpts)) {
+             this.EJS.retroarchOpts.forEach((option) => {
+@@ -407,6 +411,37 @@ IF EXIST AUTORUN.BAT CALL AUTORUN.BAT
+             }
+         })
+     }
++    loadDolphinAssets() {
++        // Dolphin needs its "Sys" data folder (fonts, game INIs, etc.).
++        // It ships as cores/dolphin-sys.zip and is unpacked to
++        // /home/web_user/retroarch/system/dolphin-emu/Sys
++        return new Promise(async (resolve, reject) => {
++            try {
++                const res = await this.EJS.downloadFile("cores/dolphin-sys.zip", this.EJS.downloadType.core.name, null, false, { responseType: "arraybuffer", method: "GET" }, true, this.EJS.downloadType.core.dontCache);
++                if (res === -1) {
++                    throw new Error("Failed to download Dolphin Sys files");
++                }
++                const root = "/home/web_user/retroarch/system/dolphin-emu/";
++                const files = res.data.files;
++                for (let i = 0; i < files.length; i++) {
++                    const path = root + files[i].filename;
++                    const parts = path.split("/");
++                    let cp = "";
++                    for (let j = 0; j < parts.length - 1; j++) {
++                        if (parts[j] === "") continue;
++                        cp += "/" + parts[j];
++                        if (!this.FS.analyzePath(cp).exists) this.FS.mkdir(cp);
++                    }
++                    if (!path.endsWith("/")) this.FS.writeFile(path, files[i].bytes);
++                }
++                resolve();
++            } catch (error) {
++                this.EJS.frontend.setLoadingText("Network Error");
++                this.EJS.frontend.textElem.style.color = "red";
++                reject(error);
++            }
++        });
++    }
+     setVSync(enabled) {
+         this.functions.setVSync(enabled);
+     }
+diff --git a/data/src/consts.js b/data/src/consts.js
+index 6d76007..fd3dd5a 100644
+--- a/data/src/consts.js
++++ b/data/src/consts.js
+@@ -38,9 +38,11 @@ export const cores = {
+     "vic20": ["vice_xvic"],
+     "dos": ["dosbox_pure"],
+     "intv": ["freeintv"],
+-    "3ds": ["azahar"]
++    "3ds": ["azahar"],
++    "gamecube": ["dolphin"],
++    "wii": ["dolphin"]
+ };
+ 
+-export const requiresThreads = ["ppsspp", "dosbox_pure", "azahar"];
++export const requiresThreads = ["ppsspp", "dosbox_pure", "azahar", "dolphin"];
+ 
+-export const requiresWebGL2 = ["ppsspp", "azahar"];
++export const requiresWebGL2 = ["ppsspp", "azahar", "dolphin"];
+diff --git a/data/src/emulator.js b/data/src/emulator.js
+index fce1457..f941daf 100644
+--- a/data/src/emulator.js
++++ b/data/src/emulator.js
+@@ -867,6 +867,9 @@ class EmulatorJS {
+         if (this.getCore() === "ppsspp") {
+             await this.gameManager.loadPpssppAssets();
+         }
++        if (this.getCore() === "dolphin") {
++            await this.gameManager.loadDolphinAssets();
++        }
+     }
+ 
+     /**

@@ -1,0 +1,17 @@
+{
+  "name": "dolphin",
+  "extensions": ["iso", "gcm", "gcz", "rvz", "wia", "wbfs", "ciso", "dol", "elf", "tgc", "wad"],
+  "options": {
+    "file": "dolphin-emu/dolphin-emu.opt",
+    "settings": {
+      "dolphin_renderer": "Hardware",
+      "dolphin_efb_scale": "1",
+      "dolphin_dsp_hle": "enabled"
+    },
+    "defaultWebGL2": true,
+    "requireThreads": true
+  },
+  "save": "srm",
+  "license": "COPYING",
+  "repo": "https://github.com/libretro/dolphin"
+}

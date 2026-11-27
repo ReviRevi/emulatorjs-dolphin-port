@@ -1,0 +1,317 @@
+diff --git a/Externals/libusb/CMakeLists.txt b/Externals/libusb/CMakeLists.txt
+index 39c2960..d95d49f 100644
+--- a/Externals/libusb/CMakeLists.txt
++++ b/Externals/libusb/CMakeLists.txt
+@@ -62,6 +62,9 @@ elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+   else()
+     target_sources(usb PRIVATE libusb/libusb/os/linux_netlink.c)
+   endif()
++elseif(EMSCRIPTEN)
++  # No USB access from the browser sandbox (WebUSB backend needs async JS).
++  target_sources(usb PRIVATE libusb/libusb/os/null_usb.c)
+ elseif(${CMAKE_SYSTEM_NAME} MATCHES "NetBSD")
+   target_sources(usb PRIVATE libusb/libusb/os/netbsd_usb.c)
+ elseif(${CMAKE_SYSTEM_NAME} MATCHES "OpenBSD")
+diff --git a/Source/Core/Common/CMakeLists.txt b/Source/Core/Common/CMakeLists.txt
+index 66a074a..595001e 100644
+--- a/Source/Core/Common/CMakeLists.txt
++++ b/Source/Core/Common/CMakeLists.txt
+@@ -232,6 +232,11 @@ else()
+ endif()
+ 
+ if(LIBRETRO AND SWITCH2)
++elseif(EMSCRIPTEN)
++  target_sources(common PRIVATE
++    Logging/ConsoleListenerNix.cpp
++    MemArenaEmscripten.cpp
++  )
+ elseif(ANDROID)
+   target_sources(common PRIVATE
+     Logging/ConsoleListenerDroid.cpp
+diff --git a/Source/Core/Common/MemArena.h b/Source/Core/Common/MemArena.h
+index f2f86ee..eb16b84 100644
+--- a/Source/Core/Common/MemArena.h
++++ b/Source/Core/Common/MemArena.h
+@@ -149,7 +149,7 @@ private:
+   vm_address_t m_region_address = 0;
+   vm_size_t m_region_size = 0;
+ #else
+-#if defined(__LIBRETRO__) && defined(__SWITCH2__)
++#if (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
+   u8* m_backing = nullptr;
+   size_t m_backing_size = 0;
+ #endif
+diff --git a/Source/Core/Common/MemArenaEmscripten.cpp b/Source/Core/Common/MemArenaEmscripten.cpp
+new file mode 100644
+index 0000000..b41c39d
+--- /dev/null
++++ b/Source/Core/Common/MemArenaEmscripten.cpp
+@@ -0,0 +1,62 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Emscripten/WebAssembly: no mmap-based views, so back the arena with a
++// single allocation (same strategy as the Switch 2 port).
++#if defined(__EMSCRIPTEN__)
++
++#include "Common/MemArena.h"
++
++#include <cstring>
++#include "Common/MemoryUtil.h"
++
++namespace Common
++{
++MemArena::MemArena() = default;
++MemArena::~MemArena() = default;
++
++void MemArena::GrabSHMSegment(size_t size, std::string_view)
++{
++  m_backing = static_cast<u8*>(AllocateMemoryPages(size));
++  m_backing_size = m_backing ? size : 0;
++}
++
++void MemArena::ReleaseSHMSegment()
++{
++  FreeMemoryPages(m_backing, m_backing_size);
++  m_backing = nullptr;
++  m_backing_size = 0;
++}
++
++void* MemArena::CreateView(s64 offset, size_t size)
++{
++  if (!m_backing || offset < 0 || static_cast<u64>(offset) > m_backing_size ||
++      size > m_backing_size - static_cast<size_t>(offset))
++    return nullptr;
++
++  // Views borrow the backing allocation until ReleaseSHMSegment.
++  return m_backing + offset;
++}
++
++void MemArena::ReleaseView(void*, size_t) {}
++u8* MemArena::ReserveMemoryRegion(size_t) { return nullptr; }
++void MemArena::ReleaseMemoryRegion() {}
++void* MemArena::MapInMemoryRegion(s64, size_t, void*, bool) { return nullptr; }
++bool MemArena::ChangeMappingProtection(void*, size_t, bool) { return false; }
++void MemArena::UnmapFromMemoryRegion(void*, size_t) {}
++size_t MemArena::GetPageSize() const { return 0x1000; }
++
++LazyMemoryRegion::LazyMemoryRegion() = default;
++LazyMemoryRegion::~LazyMemoryRegion() { Release(); }
++
++void* LazyMemoryRegion::Create(size_t)
++{
++  // No demand-paged mappings; callers must use their bounded fallback.
++  return nullptr;
++}
++
++void LazyMemoryRegion::Clear() {}
++void LazyMemoryRegion::Release() {}
++}  // namespace Common
++
++#endif
+diff --git a/Source/Core/Common/MemoryUtil.cpp b/Source/Core/Common/MemoryUtil.cpp
+index 5d5085a..6a9b9ef 100644
+--- a/Source/Core/Common/MemoryUtil.cpp
++++ b/Source/Core/Common/MemoryUtil.cpp
+@@ -358,6 +358,9 @@ size_t MemPhysical()
+   system_info sysinfo;
+   get_system_info(&sysinfo);
+   return static_cast<size_t>(sysinfo.max_pages * B_PAGE_SIZE);
++#elif defined(__EMSCRIPTEN__)
++  // wasm32 address space is at most 4 GiB; there is no sysinfo().
++  return size_t{0xFFFFFFFF};
+ #else
+   struct sysinfo memInfo;
+   sysinfo(&memInfo);
+diff --git a/Source/Core/Common/Thread.cpp b/Source/Core/Common/Thread.cpp
+index ac99e31..f9ec8a6 100644
+--- a/Source/Core/Common/Thread.cpp
++++ b/Source/Core/Common/Thread.cpp
+@@ -178,8 +178,8 @@ void SwitchCurrentThread()
+ 
+ void SetCurrentThreadName(const char* name)
+ {
+-#if defined(__LIBRETRO__) && defined(__SWITCH2__)
+-  // The SDK has no thread-name API.
++#if (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
++  // No thread-name API (Switch 2 SDK / Emscripten).
+ #elif defined(__APPLE__)
+   pthread_setname_np(name);
+ #elif defined __FreeBSD__ || defined __OpenBSD__
+diff --git a/Source/Core/Common/Timer.cpp b/Source/Core/Common/Timer.cpp
+index e2a3be8..80e44d2 100644
+--- a/Source/Core/Common/Timer.cpp
++++ b/Source/Core/Common/Timer.cpp
+@@ -210,7 +210,7 @@ auto SteadyAwakeClock::now() -> time_point
+   // Note that Linux's CLOCK_MONOTONIC "does not count time that the system is suspended".
+   // This is in contrast to the behavior on macOS and FreeBSD.
+   static constexpr auto clock_id =
+-#if defined(__linux__) || (defined(__LIBRETRO__) && defined(__SWITCH2__))
++#if defined(__linux__) || defined(__EMSCRIPTEN__) || (defined(__LIBRETRO__) && defined(__SWITCH2__))
+       CLOCK_MONOTONIC;
+ #elif defined(__APPLE__)
+       CLOCK_UPTIME_RAW;
+diff --git a/Source/Core/Core/HW/DVD/AMMediaboard.cpp b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
+index fdafc56..c6839d1 100644
+--- a/Source/Core/Core/HW/DVD/AMMediaboard.cpp
++++ b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
+@@ -36,7 +36,7 @@
+ #include "VideoCommon/OnScreenDisplay.h"
+ 
+ #if defined(__linux__) or defined(__APPLE__) or defined(__FreeBSD__) or defined(__NetBSD__) or     \
+-    defined(__OpenBSD__) or defined(__HAIKU__) or (defined(__LIBRETRO__) && defined(__SWITCH2__))
++    defined(__OpenBSD__) or defined(__HAIKU__) or (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
+ 
+ #include <unistd.h>
+ 
+diff --git a/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h b/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h
+index fbd4a16..212797a 100644
+--- a/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h
++++ b/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h
+@@ -413,7 +413,7 @@ private:
+     bool m_bba_failure_notified = false;
+ #if defined(WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) ||          \
+     defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__) || \
+-    (defined(__LIBRETRO__) && defined(__SWITCH2__))
++    (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
+     sf::UdpSocket m_sf_socket;
+     sf::IpAddress m_sf_recipient_ip = sf::IpAddress::Any;
+     char m_in_frame[9004]{};
+@@ -458,7 +458,7 @@ private:
+     sf::TcpListener m_upnp_httpd;
+ #if defined(WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) ||          \
+     defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__) || \
+-    (defined(__LIBRETRO__) && defined(__SWITCH2__))
++    (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
+     NetworkRef m_network_ref;
+     std::thread m_read_thread;
+     Common::Flag m_read_enabled;
+diff --git a/Source/Core/Core/IOS/Network/Socket.h b/Source/Core/Core/IOS/Network/Socket.h
+index e0880c6..fbafe8b 100644
+--- a/Source/Core/Core/IOS/Network/Socket.h
++++ b/Source/Core/Core/IOS/Network/Socket.h
+@@ -15,7 +15,7 @@ typedef pollfd pollfd_t;
+ #define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
+ 
+ #elif defined(__linux__) or defined(__APPLE__) or defined(__FreeBSD__) or defined(__NetBSD__) or   \
+-    defined(__OpenBSD__) or defined(__HAIKU__) or (defined(__LIBRETRO__) && defined(__SWITCH2__))
++    defined(__OpenBSD__) or defined(__HAIKU__) or (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
+ #include <arpa/inet.h>
+ #include <fcntl.h>
+ #include <net/if.h>
+diff --git a/Source/Core/DolphinLibretro/Boot.cpp b/Source/Core/DolphinLibretro/Boot.cpp
+index 6cee24f..66b2bc4 100644
+--- a/Source/Core/DolphinLibretro/Boot.cpp
++++ b/Source/Core/DolphinLibretro/Boot.cpp
+@@ -388,7 +388,7 @@ bool retro_load_game(const struct retro_game_info* game)
+             core::CPU_CORE,
+             static_cast<int>(PowerPC::DefaultCPUCore()))));
+ 
+-#if defined(_DEBUG) || defined(__SWITCH2__)
++#if defined(_DEBUG) || defined(__SWITCH2__) || defined(__EMSCRIPTEN__)
+   Config::SetBase(Config::MAIN_FASTMEM, false);
+   Config::SetBase(Config::MAIN_FASTMEM_ARENA, false);
+ #else
+@@ -404,8 +404,17 @@ bool retro_load_game(const struct retro_game_info* game)
+                      Libretro::GetOption<bool>(audio::DSP_HLE, /*def=*/true));
+ 
+   // dual core (true) or single core (false)
++#if defined(__EMSCRIPTEN__)
++  // WebAssembly: run the whole emulator inside retro_run on the browser's main
++  // loop. Dual-core mode would block the main thread waiting on workers, and
++  // worker filesystem calls are proxied to the main thread -> deadlock risk.
++  Config::SetBase(Config::MAIN_CPU_THREAD, false);
++  if (Config::Get(Config::MAIN_CPU_CORE) != PowerPC::CPUCore::Interpreter)
++    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::CachedInterpreter);
++#else
+   Config::SetBase(Config::MAIN_CPU_THREAD,
+     Libretro::GetOption<bool>(core::MAIN_CPU_THREAD, /*def=*/true));
++#endif
+ 
+   // Dual core's GPU thread kept in step with the CPU thread (Dolphin's "Synchronize GPU Thread").
+   Config::SetBase(Config::MAIN_SYNC_GPU,
+diff --git a/Source/Core/DolphinLibretro/CMakeLists.txt b/Source/Core/DolphinLibretro/CMakeLists.txt
+index 159e6a6..361c500 100644
+--- a/Source/Core/DolphinLibretro/CMakeLists.txt
++++ b/Source/Core/DolphinLibretro/CMakeLists.txt
+@@ -1,5 +1,10 @@
+ 
+-add_library(dolphin_libretro SHARED
++if(EMSCRIPTEN)
++  set(DOLPHIN_LR_LIBTYPE STATIC)
++else()
++  set(DOLPHIN_LR_LIBTYPE SHARED)
++endif()
++add_library(dolphin_libretro ${DOLPHIN_LR_LIBTYPE}
+   Audio.cpp
+   Boot.cpp
+   Host.cpp
+diff --git a/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp b/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
+index a3f108e..73f84ff 100644
+--- a/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
++++ b/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
+@@ -22,6 +22,10 @@
+ #include "Common/DynamicLibrary.h"
+ #endif
+ 
++#if defined(__EMSCRIPTEN__)
++#include <emscripten/html5_webgl.h>
++#endif
++
+ namespace
+ {
+ // Version/profile of the frontend context, so worker contexts are created to match it.
+@@ -312,6 +316,13 @@ GLContextLR::~GLContextLR() = default;
+ 
+ void* GLContextLR::GetFuncAddress(const std::string& name)
+ {
++#if defined(__EMSCRIPTEN__)
++  // The generic emscripten GetProcAddress resolves some core GLES3 entry points
++  // (e.g. glGenQueries) to their WebGL1 EXT variants, which don't exist on a
++  // WebGL2 context. Ask for the WebGL2 implementation first.
++  if (void* p = emscripten_webgl2_get_proc_address(name.c_str()))
++    return p;
++#endif
+   return (void*)Libretro::Video::hw_render.get_proc_address(name.c_str());
+ }
+ 
+diff --git a/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp b/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
+index 2eec584..fae48f3 100644
+--- a/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
++++ b/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
+@@ -315,7 +315,13 @@ public:
+ 
+   ~BufferSubData() override { delete[] m_pointer; }
+   std::pair<u8*, u32> Map(u32 size) override { return std::make_pair(m_pointer, 0); }
+-  void Unmap(u32 used_size) override { glBufferSubData(m_buffertype, 0, used_size, m_pointer); }
++  void Unmap(u32 used_size) override
++  {
++    // Re-bind: the element-array binding is per-VAO and others may have been
++    // rebound since Map() (WebGL rejects the upload with "no buffer").
++    glBindBuffer(m_buffertype, m_buffer);
++    glBufferSubData(m_buffertype, 0, used_size, m_pointer);
++  }
+   u8* m_pointer;
+ };
+ 
+@@ -337,6 +343,7 @@ public:
+   std::pair<u8*, u32> Map(u32 size) override { return std::make_pair(m_pointer, 0); }
+   void Unmap(u32 used_size) override
+   {
++    glBindBuffer(m_buffertype, m_buffer);
+     glBufferData(m_buffertype, used_size, m_pointer, GL_STREAM_DRAW);
+   }
+ 
+diff --git a/Source/Core/VideoCommon/DriverDetails.cpp b/Source/Core/VideoCommon/DriverDetails.cpp
+index deb005b..65a1ea1 100644
+--- a/Source/Core/VideoCommon/DriverDetails.cpp
++++ b/Source/Core/VideoCommon/DriverDetails.cpp
+@@ -43,7 +43,7 @@ constexpr u32 m_os = OS_ALL | OS_OPENBSD;
+ constexpr u32 m_os = OS_ALL | OS_NETBSD;
+ #elif __HAIKU__
+ constexpr u32 m_os = OS_ALL | OS_HAIKU;
+-#elif (defined(__LIBRETRO__) && defined(__SWITCH2__))
++#elif (defined(__LIBRETRO__) && defined(__SWITCH2__)) || defined(__EMSCRIPTEN__)
+ constexpr u32 m_os = OS_ALL;
+ #endif
+ 

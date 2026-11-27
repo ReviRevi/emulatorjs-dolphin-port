@@ -1,0 +1,24 @@
+diff --git a/emulatorjs/build-emulatorjs.sh b/emulatorjs/build-emulatorjs.sh
+index 3c05ecf..f0cacec 100755
+--- a/emulatorjs/build-emulatorjs.sh
++++ b/emulatorjs/build-emulatorjs.sh
+@@ -61,13 +61,13 @@ fi
+ 
+ lastGles=0
+ 
+-largeStack=("mupen64plus_next" "azahar")
++largeStack=("dolphin" "mupen64plus_next" "azahar")
+ useOpenAL=()
+-largeHeap=("mupen64plus_next" "picodrive" "pcsx_rearmed" "genesis_plus_gx" "genesis_plus_gx_wide" "mednafen_psx" "mednafen_psx_hw" "parallel_n64" "ppsspp" "azahar")
+-needsGles3=("ppsspp" "azahar")
+-needsThreads=("ppsspp" "azahar")
+-largeThreads=("ppsspp" "azahar")
+-noCHD=("mame2003" "mame2003_plus" "pcsx_rearmed" "genesis_plus_gx" "genesis_plus_gx_wide" "azahar")
++largeHeap=("dolphin" "mupen64plus_next" "picodrive" "pcsx_rearmed" "genesis_plus_gx" "genesis_plus_gx_wide" "mednafen_psx" "mednafen_psx_hw" "parallel_n64" "ppsspp" "azahar")
++needsGles3=("dolphin" "ppsspp" "azahar")
++needsThreads=("dolphin" "ppsspp" "azahar")
++largeThreads=("dolphin" "ppsspp" "azahar")
++noCHD=("dolphin" "mame2003" "mame2003_plus" "pcsx_rearmed" "genesis_plus_gx" "genesis_plus_gx_wide" "azahar")
+ no7Zip=("bsnes")
+ needsAsync=("mupen64plus_next" "dosbox_pure" "ppsspp" "azahar" "bsnes" "bluemsx" "scummvm")
+ 

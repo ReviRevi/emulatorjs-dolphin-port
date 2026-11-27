@@ -1,0 +1,4 @@
+work/
+*.png
+node_modules/
+gc-core-bundle.tgz

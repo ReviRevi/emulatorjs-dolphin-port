@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Dolphin (EmulatorJS) test</title>
+<style>body{margin:0;background:#111}#game{width:960px;height:720px;max-width:100vw}</style></head>
+<body>
+<div id="game"></div>
+<script>
+  const params = new URLSearchParams(location.search);
+  EJS_player = "#game";
+  EJS_core = params.get("system") || "gamecube";
+  EJS_gameUrl = params.get("game") || "colorbars.dol";
+  EJS_pathtodata = "data/";
+  EJS_threads = true;
+  EJS_startOnLoaded = true;
+  EJS_DEBUG_XX = true;
+</script>
+<script src="data/loader.js"></script>
+</body>
+</html>
