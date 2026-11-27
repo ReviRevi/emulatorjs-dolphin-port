@@ -6,8 +6,9 @@ A GameCube / Wii **RetroArch (libretro) core for the browser**, built from
 
 > **Status: experimental proof of concept.** The core loads in EmulatorJS, boots
 > GameCube programs, and renders through Dolphin's own hardware renderer on WebGL2.
-> The CPU is emulated by Dolphin's *cached interpreter* (no JIT yet), so expect
-> commercial games to run well below full speed.
+> The CPU runs on a new **PowerPC → WebAssembly JIT** (integer, memory and branch
+> instructions so far; floating point still interpreted), so commercial games are
+> still below full speed.
 
 ## Try it
 

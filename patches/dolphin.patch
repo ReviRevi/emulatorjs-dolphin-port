@@ -151,6 +151,19 @@ index e2a3be8..80e44d2 100644
        CLOCK_MONOTONIC;
  #elif defined(__APPLE__)
        CLOCK_UPTIME_RAW;
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 5761687..f722f6b 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -519,6 +519,8 @@ add_library(core
+   PowerPC/CachedInterpreter/CachedInterpreterBlockCache.h
+   PowerPC/CachedInterpreter/CachedInterpreterEmitter.cpp
+   PowerPC/CachedInterpreter/CachedInterpreterEmitter.h
++  PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
++  PowerPC/CachedInterpreter/WasmEmitter.h
+   PowerPC/ConditionRegister.cpp
+   PowerPC/ConditionRegister.h
+   PowerPC/Expression.cpp
 diff --git a/Source/Core/Core/HW/DVD/AMMediaboard.cpp b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
 index fdafc56..c6839d1 100644
 --- a/Source/Core/Core/HW/DVD/AMMediaboard.cpp
@@ -199,6 +212,1898 @@ index e0880c6..fbafe8b 100644
  #include <arpa/inet.h>
  #include <fcntl.h>
  #include <net/if.h>
+diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp
+index 3ec24a3..3f1aa78 100644
+--- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp
++++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp
+@@ -61,6 +61,30 @@ void CachedInterpreter::ExecuteOneBlock()
+     return;
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  if (*reinterpret_cast<const AnyCallback*>(normal_entry) == AnyCallbackCast(WasmEntry))
++  {
++    auto& entry = *reinterpret_cast<WasmEntryOperands*>(const_cast<u8*>(normal_entry) +
++                                                        sizeof(AnyCallback));
++    if (entry.fn == 0 && entry.calls != 0xffffffff && ++entry.calls == WASM_JIT_THRESHOLD)
++      CompileWasm(entry);
++    if (entry.fn != 0)
++    {
++      // A table index is a function pointer in WebAssembly. A compiled block
++      // returns the next compiled block when it can (block chaining), and 0
++      // when the dispatcher has to take over (downcount ran out, the next
++      // block isn't compiled, an exception, ...).
++      using BlockFn = u32 (*)();
++      u32 fn = entry.fn;
++      do
++        fn = reinterpret_cast<BlockFn>(static_cast<uintptr_t>(fn))();
++      while (fn != 0);
++      return;
++    }
++    normal_entry += sizeof(AnyCallback) + sizeof(WasmEntryOperands);
++  }
++#endif
++
+   auto& ppc_state = m_ppc_state;
+   while (true)
+   {
+@@ -354,6 +378,10 @@ bool CachedInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
+   auto& cpu = m_system.GetCPU();
+   auto& breakpoints = power_pc.GetBreakPoints();
+ 
++#ifdef __EMSCRIPTEN__
++  Write(WasmEntry, {0, 0, b});
++#endif
++
+   if (IsProfilingEnabled())
+     Write(StartProfiledBlock, {js.curBlock->profile_data.get()});
+ 
+diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h
+index dd940e8..4d30dea 100644
+--- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h
++++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h
+@@ -54,6 +54,13 @@ public:
+   std::size_t DisassembleFarCode(const JitBlock& block, std::ostream& stream) const override;
+ 
+   JitBaseBlockCache* GetBlockCache() override { return &m_block_cache; }
++
++#ifdef __EMSCRIPTEN__
++  // WebAssembly JIT tier (CachedInterpreterWasm.cpp): hot blocks get their
++  // callback list compiled into a WebAssembly function.
++  static constexpr u32 WASM_JIT_THRESHOLD = 16;  // runs before a block is compiled
++  static void OnDestroyBlock(const JitBlock& block);
++#endif
+   const char* GetName() const override { return "Cached Interpreter"; }
+   const CommonAsmRoutinesBase* GetAsmRoutines() override { return nullptr; }
+ 
+@@ -72,6 +79,13 @@ private:
+ 
+   void LogGeneratedCode() const;
+ 
++#ifdef __EMSCRIPTEN__
++  struct WasmEntryOperands;
++  static s32 WasmEntry(PowerPC::PowerPCState& ppc_state, const WasmEntryOperands& operands);
++  static s32 WasmEntry(std::ostream& stream, const WasmEntryOperands& operands);
++  void CompileWasm(WasmEntryOperands& entry);
++#endif
++
+   struct StartProfiledBlockOperands;
+   template <bool profiled>
+   struct EndBlockOperands;
+@@ -174,3 +188,15 @@ struct CachedInterpreter::CheckIdleOperands
+   CoreTiming::CoreTimingManager& core_timing;
+   u32 idle_pc;
+ };
++
++#ifdef __EMSCRIPTEN__
++// First callback of every block. `fn` is the compiled block's table index
++// (0: not compiled yet); `calls` counts runs until it's hot enough to compile.
++struct CachedInterpreter::WasmEntryOperands
++{
++  u32 fn;
++  u32 calls;
++  JitBlock* block;
++  u32 : 32;
++};
++#endif
+diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterBlockCache.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterBlockCache.cpp
+index 3b4c4a0..382db62 100644
+--- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterBlockCache.cpp
++++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterBlockCache.cpp
+@@ -4,6 +4,9 @@
+ #include "Core/PowerPC/CachedInterpreter/CachedInterpreterBlockCache.h"
+ 
+ #include "Core/PowerPC/CachedInterpreter/CachedInterpreterEmitter.h"
++#ifdef __EMSCRIPTEN__
++#include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
++#endif
+ #include "Core/PowerPC/JitCommon/JitBase.h"
+ 
+ CachedInterpreterBlockCache::CachedInterpreterBlockCache(JitBase& jit) : JitBaseBlockCache{jit}
+@@ -18,6 +21,9 @@ void CachedInterpreterBlockCache::Init()
+ 
+ void CachedInterpreterBlockCache::DestroyBlock(JitBlock& block)
+ {
++#ifdef __EMSCRIPTEN__
++  CachedInterpreter::OnDestroyBlock(block);  // before the base poisons the entry
++#endif
+   JitBaseBlockCache::DestroyBlock(block);
+ 
+   if (block.near_begin != block.near_end)
+diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
+new file mode 100644
+index 0000000..f58a070
+--- /dev/null
++++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
+@@ -0,0 +1,1452 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// WebAssembly JIT tier for the Cached Interpreter (Emscripten builds only).
++//
++// WebAssembly can't run machine code it writes into memory, but it can compile
++// a new module at run time and call it through the function table. Once a
++// block has run WASM_JIT_THRESHOLD times, its callback list is translated into
++// a WebAssembly function that does the same work without the dispatch loop:
++//
++//   Interpret<..>            -> direct call of the Interpreter instruction
++//                               (or inline WebAssembly, see EmitInline)
++//   every other callback     -> call it with its operands; return if it
++//                               returns 0 (block exit)
++//
++// The function is compiled with `new WebAssembly.Module`, instantiated with
++// the main module's table and memory, and put in the table; its index goes in
++// the block's WasmEntry operands, which ExecuteOneBlock checks first.
++//
++// The table is per thread, so compiled blocks may only run on the thread that
++// compiled them. On the web the CPU always runs on the browser's main thread
++// (single-core mode, see DolphinLibretro/Boot.cpp), so this holds.
++
++#ifdef __EMSCRIPTEN__
++
++#include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
++
++#include <cstddef>
++#include <functional>
++#include <ostream>
++#include <vector>
++
++#include <emscripten.h>
++#include <fmt/ostream.h>
++
++#include "Common/Logging/Log.h"
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/ConditionRegister.h"
++#include "Core/PowerPC/Gekko.h"
++#include "Core/PowerPC/MMU.h"
++#include "Core/System.h"
++#include "Core/Debugger/BranchWatch.h"
++#include "Core/PowerPC/CachedInterpreter/WasmEmitter.h"
++#include "Core/PowerPC/Interpreter/Interpreter.h"
++#include "Core/PowerPC/PPCTables.h"
++#include "Core/PowerPC/PowerPC.h"
++
++// clang-format off
++EM_JS(int, dolphin_wasm_jit_install, (const unsigned char* ptr, int len), {
++  try {
++    var mod = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
++    var inst = new WebAssembly.Instance(mod, { e: { t: wasmTable, m: wasmMemory } });
++    var free = Module["__wasmJitFree"] || (Module["__wasmJitFree"] = []);
++    var idx = free.length ? free.pop() : wasmTable.grow(1);
++    wasmTable.set(idx, inst.exports["f"]);
++    Module["wasmJitBlocks"] = (Module["wasmJitBlocks"] || 0) + 1;
++    return idx;
++  } catch (e) {
++    err("Dolphin WebAssembly JIT: " + e);
++    return 0;
++  }
++});
++
++// JIT mode, from the page: globalThis.DOLPHIN_WASM_JIT = 0 (off: plain Cached
++// Interpreter), 1 (compile blocks, but only as calls into the Interpreter) or
++// 2 (default: inline code). Read when a block is compiled.
++EM_JS(int, dolphin_wasm_jit_mode, (), {
++  var m = globalThis["DOLPHIN_WASM_JIT"];
++  return typeof m === "number" ? m : 2;
++});
++
++// Whether the browser supports WebAssembly tail calls (return_call_indirect):
++// then a block jumps straight into the next block instead of returning it to
++// the C++ loop. Checked once with a tiny module.
++EM_JS(int, dolphin_wasm_jit_tailcalls, (), {
++  if (Module["__wasmJitTail"] === undefined) {
++    // (module (table 1 funcref) (type (func)) (func (return_call_indirect (type 0) (i32.const 0))))
++    var bytes = new Uint8Array([0,97,115,109,1,0,0,0, 1,4,1,96,0,0, 3,2,1,0, 4,4,1,112,0,1,
++                                10,9,1,7,0,65,0,19,0,0,11]);
++    var ok = false;
++    try { ok = WebAssembly.validate(bytes); } catch (e) {}
++    Module["__wasmJitTail"] = ok ? 1 : 0;
++  }
++  return Module["__wasmJitTail"];
++});
++
++// Statistics for tuning: which instructions fell back to the Interpreter.
++EM_JS(void, dolphin_wasm_jit_note_fallback, (const char* name), {
++  var s = Module["wasmJitFallbacks"] || (Module["wasmJitFallbacks"] = {});
++  var n = UTF8ToString(name);
++  s[n] = (s[n] || 0) + 1;
++});
++
++EM_JS(void, dolphin_wasm_jit_free, (int idx), {
++  wasmTable.set(idx, null);
++  (Module["__wasmJitFree"] || (Module["__wasmJitFree"] = [])).push(idx);
++});
++// clang-format on
++
++
++namespace
++{
++constexpr u32 WASM_JIT_NEVER = 0xffffffff;  // compile failed: stay interpreted
++
++// Locals of a compiled block function.
++enum Local : u32
++{
++  L_EA = 0,    // effective address
++  L_E = 1,     // BAT table entry
++  L_PHYS = 2,  // physical address
++  L_WI = 3,    // write-through / cache-inhibited bit from the BAT
++  L_HOST = 4,  // host address of the access
++  L_T = 5,     // scratch
++  L_V = 6,     // result value
++  L_GPR0 = 7,  // r0..r31 cached in locals (Emitter::PushGPR / SetGPR)
++  L_I32_COUNT = 7 + 32,
++  L_X = L_I32_COUNT,  // i64 scratch
++};
++
++// Everything the inline code needs to know about the emulated machine. The
++// addresses are fixed for the lifetime of the emulation (and blocks are
++// thrown away with the JIT cache when they change).
++struct Machine
++{
++  u32 ppc;          // &PowerPCState
++  u32 gpr;          // offsetof(gpr)
++  u32 cr;           // offsetof(cr.fields)
++  u32 msr;          // offsetof(msr)
++  u32 xer_ca;       // offsetof(xer_ca)
++  u32 xer_so_ov;    // offsetof(xer_so_ov)
++  u32 dcache;       // offsetof(m_enable_dcache)
++  u32 cr_table;     // &ConditionRegister::s_crTable
++  u32 dbat;         // &MMU::m_dbat_table
++  u32 ram;          // Memory::GetRAM()
++  u32 ram_mask;
++  u32 exram;        // Memory::GetEXRAM() (0 on GameCube)
++  u32 exram_size;
++  u32 pc;           // offsetof(pc)
++  u32 npc;          // offsetof(npc)
++  u32 spr;          // offsetof(spr)
++  u32 downcount;    // offsetof(downcount)
++  u32 feature_flags;  // offsetof(feature_flags)
++  bool dr;          // the block runs with MSR.DR set (blocks are per MSR.DR/IR,
++                    // and instructions that change the MSR end the block)
++};
++
++class Emitter
++{
++public:
++  Emitter(WasmJit::CodeWriter& c, const Machine& m) : c(c), m(m) {}
++
++  // ---- registers ----
++  // GPRs live in locals within a block: loaded on first use, written back
++  // (Flush) before anything that reads PowerPCState (Interpreter calls,
++  // callbacks, block exit) and reloaded after anything that may write it.
++  //
++  // Rule for control flow: a register must not be loaded for the first time
++  // inside a conditional path (its local would be stale on the other path),
++  // so ops Use() their registers before branching.
++  void PushGPR(u32 r)
++  {
++    Use(r);
++    c.LocalGet(L_GPR0 + r);
++  }
++  void Use(u32 r)
++  {
++    if (loaded & (1u << r))
++      return;
++    c.I32ConstU(m.ppc);
++    c.I32Load(m.gpr + 4 * r);
++    c.LocalSet(L_GPR0 + r);
++    loaded |= 1u << r;
++  }
++  // r = value()
++  template <typename F>
++  void SetGPR(u32 r, F value)
++  {
++    value();
++    c.LocalSet(L_GPR0 + r);
++    loaded |= 1u << r;
++    dirty |= 1u << r;
++  }
++  void SetGPRFromLocal(u32 r, u32 local)
++  {
++    SetGPR(r, [&] { c.LocalGet(local); });
++  }
++  // Write dirty registers back to PowerPCState. With `keep_dirty`, only emit
++  // the stores (for one branch of a conditional; the other branch still has
++  // them dirty).
++  void Flush(bool keep_dirty = false)
++  {
++    for (u32 r = 0; r < 32; r++)
++    {
++      if (!(dirty & (1u << r)))
++        continue;
++      c.I32ConstU(m.ppc);
++      c.LocalGet(L_GPR0 + r);
++      c.I32Store(m.gpr + 4 * r);
++    }
++    if (!keep_dirty)
++      dirty = 0;
++  }
++  // After something that may have written registers in PowerPCState.
++  void Invalidate() { loaded = dirty = 0; }
++  // Reload r from PowerPCState into its local (it stays marked loaded).
++  void Reload(u32 r)
++  {
++    c.I32ConstU(m.ppc);
++    c.I32Load(m.gpr + 4 * r);
++    c.LocalSet(L_GPR0 + r);
++  }
++
++  u32 loaded = 0;
++  u32 dirty = 0;
++
++  void PushRAOrZero(u32 ra)
++  {
++    if (ra)
++      PushGPR(ra);
++    else
++      c.I32Const(0);
++  }
++
++  // CR0 from a 32-bit result in `local` (Interpreter::Helper_UpdateCR0).
++  void UpdateCR0(u32 local)
++  {
++    c.I32ConstU(m.ppc);
++    c.LocalGet(local);
++    c.I64ExtendI32S();
++    c.LocalGet(local);
++    c.I32Eqz();
++    c.I64ExtendI32U();
++    c.I64Const(63);
++    c.I64Shl();
++    c.I64Or();
++    c.I64Const(static_cast<s64>(~(1ULL << PowerPC::CR_EMU_SO_BIT)));
++    c.I64And();
++    PushSO();
++    c.I64ExtendI32U();
++    c.I64Const(PowerPC::CR_EMU_SO_BIT);
++    c.I64Shl();
++    c.I64Or();
++    c.I64Store(m.cr);
++  }
++  void PushSO()
++  {
++    c.I32ConstU(m.ppc);
++    c.I32Load8U(m.xer_so_ov);
++    c.I32Const(1);
++    c.I32ShrU();
++  }
++  // CR field from an LT/GT/EQ comparison of locals L_T (a) and L_V (b)
++  // (Interpreter::Helper_IntCompare).
++  void Compare(u32 crf, bool is_signed)
++  {
++    c.I32ConstU(m.ppc);
++    // index = LT*8 | GT*4 | EQ*2 | SO
++    c.LocalGet(L_T);
++    c.LocalGet(L_V);
++    is_signed ? c.I32LtS() : c.I32LtU();
++    c.I32Const(3);
++    c.I32Shl();
++    c.LocalGet(L_T);
++    c.LocalGet(L_V);
++    is_signed ? c.I32GtS() : c.I32GtU();
++    c.I32Const(2);
++    c.I32Shl();
++    c.I32Or();
++    c.LocalGet(L_T);
++    c.LocalGet(L_V);
++    c.I32Eq();
++    c.I32Const(1);
++    c.I32Shl();
++    c.I32Or();
++    PushSO();
++    c.I32Or();
++    c.I32Const(3);
++    c.I32Shl();
++    c.I32ConstU(m.cr_table);
++    c.I32Add();
++    c.I64Load();
++    c.I64Store(m.cr + 8 * crf);
++  }
++  void SetCarryFromStack()
++  {
++    // value (0/1) on the stack -> xer_ca
++    c.LocalSet(L_T);
++    c.I32ConstU(m.ppc);
++    c.LocalGet(L_T);
++    c.I32Store8(m.xer_ca);
++  }
++  void PushCarry()
++  {
++    c.I32ConstU(m.ppc);
++    c.I32Load8U(m.xer_ca);
++  }
++
++  // Pushes CR bit `bi` (0/1), like ConditionRegister::GetBit.
++  void PushCRBit(u32 bi)
++  {
++    c.I32ConstU(m.ppc);
++    c.I64Load(m.cr + 8 * (bi >> 2));
++    switch (bi & 3)
++    {
++    case 0:  // LT: bit 62
++      c.I64Const(PowerPC::CR_EMU_LT_BIT);
++      c.I64ShrU();
++      c.I32WrapI64();
++      c.I32Const(1);
++      c.I32And();
++      break;
++    case 1:  // GT: (s64)cr_val > 0
++      c.I64Const(0);
++      c.I64GtS();
++      break;
++    case 2:  // EQ: low 32 bits are zero
++      c.I32WrapI64();
++      c.I32Eqz();
++      break;
++    default:  // SO: bit 59
++      c.I64Const(PowerPC::CR_EMU_SO_BIT);
++      c.I64ShrU();
++      c.I32WrapI64();
++      c.I32Const(1);
++      c.I32And();
++      break;
++    }
++  }
++  void PushSPR(u32 index)
++  {
++    c.I32ConstU(m.ppc);
++    c.I32Load(m.spr + 4 * index);
++  }
++  template <typename F>
++  void SetSPR(u32 index, F value)
++  {
++    c.I32ConstU(m.ppc);
++    value();
++    c.I32Store(m.spr + 4 * index);
++  }
++  void SetNPC(u32 local)
++  {
++    c.I32ConstU(m.ppc);
++    c.LocalGet(local);
++    c.I32Store(m.npc);
++  }
++
++  void Bswap32()  // value on the stack
++  {
++    c.LocalTee(L_T);
++    c.I32Const(8);
++    c.I32Rotl();
++    c.I32ConstU(0x00ff00ff);
++    c.I32And();
++    c.LocalGet(L_T);
++    c.I32Const(8);
++    c.I32Rotr();
++    c.I32ConstU(0xff00ff00);
++    c.I32And();
++    c.I32Or();
++  }
++
++  // ---- memory ----
++  // Resolves L_EA to a host address in L_HOST, or branches to `slow` (a label
++  // `depth` levels out) when the fast path doesn't apply: page-crossing
++  // access, page-table translation, anything that isn't plain RAM, the data
++  // cache emulation, or a cache-inhibited store that isn't a full aligned word.
++  // Mirrors MMU::ReadFromHardware / WriteToHardware for the RAM case.
++  void Translate(u32 size, bool store, u32 depth)
++  {
++    if (size > 1)
++    {
++      c.LocalGet(L_EA);
++      c.I32ConstU(0xfff);
++      c.I32And();
++      c.I32ConstU(0x1000 - size);
++      c.I32GtU();
++      c.BrIf(depth);
++    }
++    if (!m.dr)
++    {
++      // Real mode: the effective address is physical.
++      c.LocalGet(L_EA);
++      c.LocalSet(L_PHYS);
++      c.I32Const(0);
++      c.LocalSet(L_WI);
++    }
++    else
++    {
++      // translate through the data BATs
++      c.LocalGet(L_EA);
++      c.I32Const(PowerPC::BAT_INDEX_SHIFT);
++      c.I32ShrU();
++      c.I32Const(2);
++      c.I32Shl();
++      c.I32ConstU(m.dbat);
++      c.I32Add();
++      c.I32Load();
++      c.LocalTee(L_E);
++      c.I32Const(PowerPC::BAT_MAPPED_BIT);
++      c.I32And();
++      c.I32Eqz();
++      c.BrIf(depth + 1);  // not BAT-mapped: page tables, take the slow path
++      c.LocalGet(L_E);
++      c.I32ConstU(PowerPC::BAT_RESULT_MASK);
++      c.I32And();
++      c.LocalGet(L_EA);
++      c.I32ConstU(PowerPC::BAT_PAGE_SIZE - 1);
++      c.I32And();
++      c.I32Or();
++      c.LocalSet(L_PHYS);
++      c.LocalGet(L_E);
++      c.I32Const(PowerPC::BAT_WI_BIT);
++      c.I32And();
++      c.LocalSet(L_WI);
++    }
++    // data cache emulation: slow path
++    c.I32ConstU(m.ppc);
++    c.I32Load8U(m.dcache);
++    c.BrIf(depth);
++    if (store)
++    {
++      // Cache-inhibited stores smaller than an aligned word have odd hardware
++      // behaviour (MMU::WriteToHardware): slow path.
++      c.LocalGet(L_WI);
++      if (size < 4)
++      {
++        c.BrIf(depth);
++      }
++      else
++      {
++        c.LocalGet(L_PHYS);
++        c.I32Const(3);
++        c.I32And();
++        c.I32And();
++        c.BrIf(depth);
++      }
++    }
++    // RAM: (phys & 0xF8000000) == 0
++    c.LocalGet(L_PHYS);
++    c.I32ConstU(0xF8000000);
++    c.I32And();
++    if (m.exram)
++    {
++      c.If();
++      {
++        // MEM2: (phys >> 28) == 1 && (phys & 0x0FFFFFFF) < size
++        c.LocalGet(L_PHYS);
++        c.I32Const(28);
++        c.I32ShrU();
++        c.I32Const(1);
++        c.I32Ne();
++        c.BrIf(depth + 1);
++        c.LocalGet(L_PHYS);
++        c.I32ConstU(0x0FFFFFFF);
++        c.I32And();
++        c.LocalTee(L_HOST);
++        c.I32ConstU(m.exram_size);
++        c.I32GeU();
++        c.BrIf(depth + 1);
++        c.LocalGet(L_HOST);
++        c.I32ConstU(m.exram);
++        c.I32Add();
++        c.LocalSet(L_HOST);
++      }
++      c.Else();
++      {
++        c.LocalGet(L_PHYS);
++        c.I32ConstU(m.ram_mask);
++        c.I32And();
++        c.I32ConstU(m.ram);
++        c.I32Add();
++        c.LocalSet(L_HOST);
++      }
++      c.End();
++    }
++    else
++    {
++      c.BrIf(depth);
++      c.LocalGet(L_PHYS);
++      c.I32ConstU(m.ram_mask);
++      c.I32And();
++      c.I32ConstU(m.ram);
++      c.I32Add();
++      c.LocalSet(L_HOST);
++    }
++  }
++
++  // Loads `size` bytes big-endian from L_HOST onto the stack.
++  void LoadHost(u32 size, bool sign)
++  {
++    if (size == 1)
++    {
++      c.LocalGet(L_HOST);
++      sign ? c.I32Load8S() : c.I32Load8U();
++    }
++    else if (size == 2)
++    {
++      c.LocalGet(L_HOST);
++      sign ? c.I32Load8S() : c.I32Load8U();
++      c.I32Const(8);
++      c.I32Shl();
++      c.LocalGet(L_HOST);
++      c.I32Load8U(1);
++      c.I32Or();
++    }
++    else
++    {
++      c.LocalGet(L_HOST);
++      c.I32Load();
++      Bswap32();
++    }
++  }
++  // Stores the low `size` bytes of `local` big-endian at L_HOST.
++  void StoreHost(u32 size, u32 local)
++  {
++    if (size == 1)
++    {
++      c.LocalGet(L_HOST);
++      c.LocalGet(local);
++      c.I32Store8();
++    }
++    else if (size == 2)
++    {
++      c.LocalGet(L_HOST);
++      c.LocalGet(local);
++      c.I32Const(8);
++      c.I32ShrU();
++      c.I32Store8();
++      c.LocalGet(L_HOST);
++      c.LocalGet(local);
++      c.I32Store8(1);
++    }
++    else
++    {
++      c.LocalGet(L_HOST);
++      c.LocalGet(local);
++      Bswap32();
++      c.I32Store();
++    }
++  }
++
++  WasmJit::CodeWriter& c;
++  const Machine& m;
++};
++
++}  // namespace
++
++// Emits inline WebAssembly for one instruction, with `fallback` (a call to
++// the Interpreter's version of it) for the cases the inline code doesn't
++// handle. Returns false if the instruction isn't handled inline at all.
++static bool EmitInline(Emitter& e, UGeckoInstruction inst, u32 pc, bool branch_watch,
++                       const std::function<void()>& fallback)
++{
++  WasmJit::CodeWriter& c = e.c;
++  const u32 rd = inst.RD, ra = inst.RA, rb = inst.RB;
++
++  // ---- branches (Interpreter_Branch.cpp). The block's Interpret<true> has
++  // already set pc and npc = pc + 4. Left to the Interpreter while the
++  // debugger's branch watch is recording. ----
++  auto taken_to = [&](auto push_target, bool lk) {
++    push_target();
++    c.LocalSet(Local::L_V);
++    if (lk)
++      e.SetSPR(SPR_LR, [&] { c.I32ConstU(pc + 4); });
++    e.SetNPC(Local::L_V);
++  };
++  // Pushes the BO/BI condition (counter && condition) for bc/bclr, updating
++  // CTR first unless BO says not to.
++  auto push_bo_condition = [&](u32 bo, u32 bi, bool ctr_allowed) {
++    bool have = false;
++    if (ctr_allowed && (bo & BO_DONT_DECREMENT_FLAG) == 0)
++    {
++      e.SetSPR(SPR_CTR, [&] {
++        e.PushSPR(SPR_CTR);
++        c.I32Const(1);
++        c.I32Sub();
++      });
++      // counter: (CTR != 0) ^ BO[1]
++      e.PushSPR(SPR_CTR);
++      c.I32Const(0);
++      ((bo >> 1) & 1) ? c.I32Eq() : c.I32Ne();
++      have = true;
++    }
++    else if (ctr_allowed && ((bo >> 2) & 1) == 0)
++    {
++      // BO says check CTR but not decrement: (CTR != 0) ^ BO[1]
++      e.PushSPR(SPR_CTR);
++      c.I32Const(0);
++      ((bo >> 1) & 1) ? c.I32Eq() : c.I32Ne();
++      have = true;
++    }
++    if (((bo >> 4) & 1) == 0)  // condition check
++    {
++      e.PushCRBit(bi);
++      if (((bo >> 3) & 1) == 0)
++        c.I32Eqz();
++      if (have)
++        c.I32And();
++      have = true;
++    }
++    if (!have)
++      c.I32Const(1);  // branch always
++  };
++
++  if (!branch_watch)
++  {
++    if (inst.OPCD == 18)  // bx
++    {
++      const u32 dest = u32(SignExt26(inst.LI << 2)) + (inst.AA ? 0 : pc);
++      taken_to([&] { c.I32ConstU(dest); }, inst.LK);
++      return true;
++    }
++    if (inst.OPCD == 16)  // bcx
++    {
++      const u32 dest = u32(SignExt16(s16(inst.BD << 2))) + (inst.AA ? 0 : pc);
++      push_bo_condition(inst.BO, inst.BI, true);
++      c.If();
++      taken_to([&] { c.I32ConstU(dest); }, inst.LK);
++      c.End();
++      return true;
++    }
++    if (inst.OPCD == 19 && (inst.SUBOP10 == 16 || inst.SUBOP10 == 528))  // bclrx, bcctrx
++    {
++      const bool lr = inst.SUBOP10 == 16;
++      if (!lr && (inst.BO_2 & BO_DONT_DECREMENT_FLAG) == 0)
++        return false;  // invalid form
++      // Read LR / CTR before LK overwrites LR.
++      push_bo_condition(inst.BO_2, inst.BI_2, lr);
++      c.If();
++      taken_to(
++          [&] {
++            e.PushSPR(lr ? SPR_LR : SPR_CTR);
++            c.I32Const(~3);
++            c.I32And();
++          },
++          inst.LK_3);
++      c.End();
++      return true;
++    }
++  }
++
++  // Memory access with fast path + interpreter fallback.
++  //   ea():     pushes the effective address
++  //   size, sign, store, update: access kind
++  auto mem = [&](auto ea, u32 size, bool sign, bool store, bool update) {
++    c.Block();  // $done
++    c.Block();  // $slow
++    ea();
++    c.LocalSet(Local::L_EA);
++    if (store)
++    {
++      e.PushGPR(rd);  // RS
++      c.LocalSet(Local::L_V);
++    }
++    e.Translate(size, store, 0);
++    if (store)
++    {
++      e.StoreHost(size, Local::L_V);
++    }
++    else
++    {
++      e.SetGPR(rd, [&] { e.LoadHost(size, sign); });
++    }
++    if (update)
++      e.SetGPRFromLocal(ra, Local::L_EA);
++    c.Br(1);
++    c.End();  // $slow
++    // Slow path: the Interpreter does the access from PowerPCState, so write
++    // back what's only in locals; it may change rD (loads) and rA (update).
++    e.Flush(true);
++    fallback();
++    if (!store)
++      e.Reload(rd);
++    if (update)
++      e.Reload(ra);
++    c.End();  // $done
++    if (!store)
++    {
++      e.loaded |= 1u << rd;
++      e.dirty |= 1u << rd;
++    }
++    if (update)
++    {
++      e.loaded |= 1u << ra;
++      e.dirty |= 1u << ra;
++    }
++    return true;
++  };
++  auto ea_d = [&] {
++    e.PushRAOrZero(ra);
++    c.I32Const(inst.SIMM_16);
++    c.I32Add();
++  };
++  auto ea_du = [&] {
++    e.PushGPR(ra);
++    c.I32Const(inst.SIMM_16);
++    c.I32Add();
++  };
++  auto ea_x = [&] {
++    e.PushRAOrZero(ra);
++    e.PushGPR(rb);
++    c.I32Add();
++  };
++  auto ea_xu = [&] {
++    e.PushGPR(ra);
++    e.PushGPR(rb);
++    c.I32Add();
++  };
++
++  // result of `value()` -> rD/rA, then CR0 if Rc
++  auto alu = [&](u32 dst, bool rc, auto value) {
++    value();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(dst, Local::L_V);
++    if (rc)
++      e.UpdateCR0(Local::L_V);
++    return true;
++  };
++
++  switch (inst.OPCD)
++  {
++  case 7:  // mulli
++    return alu(rd, false, [&] {
++      e.PushGPR(ra);
++      c.I32Const(inst.SIMM_16);
++      c.I32Mul();
++    });
++  case 8:  // subfic: rD = imm - rA; CA = (a == 0) || carry(0 - a, imm)
++    e.PushGPR(ra);
++    c.LocalSet(Local::L_T);
++    c.I32Const(inst.SIMM_16);
++    c.LocalGet(Local::L_T);
++    c.I32Sub();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(rd, Local::L_V);
++    // carry(x, y) = y > ~x, with x = 0 - a = -a, y = imm  ->  imm > ~(-a) = imm > a - 1
++    c.LocalGet(Local::L_T);
++    c.I32Eqz();
++    c.I32ConstU(static_cast<u32>(inst.SIMM_16));
++    c.LocalGet(Local::L_T);
++    c.I32Const(1);
++    c.I32Sub();
++    c.I32GtU();
++    c.I32Or();
++    e.SetCarryFromStack();
++    return true;
++  case 10:  // cmpli
++  case 11:  // cmpi
++    e.PushGPR(ra);
++    c.LocalSet(Local::L_T);
++    if (inst.OPCD == 11)
++      c.I32Const(inst.SIMM_16);
++    else
++      c.I32ConstU(inst.UIMM);
++    c.LocalSet(Local::L_V);
++    e.Compare(inst.CRFD, inst.OPCD == 11);
++    return true;
++  case 12:  // addic
++  case 13:  // addic.
++  {
++    const u32 imm = static_cast<u32>(static_cast<s32>(inst.SIMM_16));
++    e.PushGPR(ra);
++    c.LocalTee(Local::L_T);
++    c.I32ConstU(imm);
++    c.I32Add();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(rd, Local::L_V);
++    // carry(a, imm) = imm > ~a  <=>  result < a (unsigned)
++    c.LocalGet(Local::L_V);
++    c.LocalGet(Local::L_T);
++    c.I32LtU();
++    e.SetCarryFromStack();
++    if (inst.OPCD == 13)
++      e.UpdateCR0(Local::L_V);
++    return true;
++  }
++  case 14:  // addi
++    return alu(rd, false, [&] {
++      e.PushRAOrZero(ra);
++      c.I32Const(inst.SIMM_16);
++      c.I32Add();
++    });
++  case 15:  // addis
++    return alu(rd, false, [&] {
++      e.PushRAOrZero(ra);
++      c.I32ConstU(static_cast<u32>(inst.SIMM_16) << 16);
++      c.I32Add();
++    });
++  case 20:  // rlwimix
++  {
++    const u32 mask = MakeRotationMask(inst.MB, inst.ME);
++    return alu(ra, inst.Rc, [&] {
++      e.PushGPR(ra);
++      c.I32ConstU(~mask);
++      c.I32And();
++      e.PushGPR(inst.RS);
++      c.I32Const(inst.SH);
++      c.I32Rotl();
++      c.I32ConstU(mask);
++      c.I32And();
++      c.I32Or();
++    });
++  }
++  case 21:  // rlwinmx
++  {
++    const u32 mask = MakeRotationMask(inst.MB, inst.ME);
++    return alu(ra, inst.Rc, [&] {
++      e.PushGPR(inst.RS);
++      c.I32Const(inst.SH);
++      c.I32Rotl();
++      c.I32ConstU(mask);
++      c.I32And();
++    });
++  }
++  case 23:  // rlwnmx
++  {
++    const u32 mask = MakeRotationMask(inst.MB, inst.ME);
++    return alu(ra, inst.Rc, [&] {
++      e.PushGPR(inst.RS);
++      e.PushGPR(rb);
++      c.I32Rotl();  // wasm rotl uses the amount mod 32, like & 0x1F
++      c.I32ConstU(mask);
++      c.I32And();
++    });
++  }
++  case 24:  // ori
++  case 25:  // oris
++  case 26:  // xori
++  case 27:  // xoris
++  {
++    const u32 imm = inst.OPCD & 1 ? (u32{inst.UIMM} << 16) : u32{inst.UIMM};
++    return alu(ra, false, [&] {
++      e.PushGPR(inst.RS);
++      c.I32ConstU(imm);
++      inst.OPCD < 26 ? c.I32Or() : c.I32Xor();
++    });
++  }
++  case 28:  // andi.
++  case 29:  // andis.
++  {
++    const u32 imm = inst.OPCD == 29 ? (u32{inst.UIMM} << 16) : u32{inst.UIMM};
++    return alu(ra, true, [&] {
++      e.PushGPR(inst.RS);
++      c.I32ConstU(imm);
++      c.I32And();
++    });
++  }
++  case 32: return mem(ea_d, 4, false, false, false);   // lwz
++  case 33: return mem(ea_du, 4, false, false, true);   // lwzu
++  case 34: return mem(ea_d, 1, false, false, false);   // lbz
++  case 35: return mem(ea_du, 1, false, false, true);   // lbzu
++  case 36: return mem(ea_d, 4, false, true, false);    // stw
++  case 37: return mem(ea_du, 4, false, true, true);    // stwu
++  case 38: return mem(ea_d, 1, false, true, false);    // stb
++  case 39: return mem(ea_du, 1, false, true, true);    // stbu
++  case 40: return mem(ea_d, 2, false, false, false);   // lhz
++  case 41: return mem(ea_du, 2, false, false, true);   // lhzu
++  case 42: return mem(ea_d, 2, true, false, false);    // lha
++  case 43: return mem(ea_du, 2, true, false, true);    // lhau
++  case 44: return mem(ea_d, 2, false, true, false);    // sth
++  case 45: return mem(ea_du, 2, false, true, true);    // sthu
++  case 31:
++    break;
++  default:
++    return false;
++  }
++
++  // ---- opcode 31 ----
++  if (inst.OE)
++  {
++    // Overflow-enable forms (rare): leave to the interpreter. OE shares a bit
++    // with SUBOP10's top bit, so only XO-form ops reach here with OE set;
++    // X-form ops whose SUBOP10 >= 512 are matched before this check below.
++  }
++  const u32 xo = inst.SUBOP10;
++  const u32 rs = inst.RS;
++  auto binop = [&](u32 dst, auto op) {  // dst = op(rA/rS, rB)
++    return alu(dst, inst.Rc, op);
++  };
++
++  switch (xo)
++  {
++  case 0:   // cmp
++  case 32:  // cmpl
++    e.PushGPR(ra);
++    c.LocalSet(Local::L_T);
++    e.PushGPR(rb);
++    c.LocalSet(Local::L_V);
++    e.Compare(inst.CRFD, xo == 0);
++    return true;
++  case 23: return mem(ea_x, 4, false, false, false);   // lwzx
++  case 55: return mem(ea_xu, 4, false, false, true);   // lwzux
++  case 87: return mem(ea_x, 1, false, false, false);   // lbzx
++  case 119: return mem(ea_xu, 1, false, false, true);  // lbzux
++  case 151: return mem(ea_x, 4, false, true, false);   // stwx
++  case 183: return mem(ea_xu, 4, false, true, true);   // stwux
++  case 215: return mem(ea_x, 1, false, true, false);   // stbx
++  case 247: return mem(ea_xu, 1, false, true, true);   // stbux
++  case 279: return mem(ea_x, 2, false, false, false);  // lhzx
++  case 311: return mem(ea_xu, 2, false, false, true);  // lhzux
++  case 343: return mem(ea_x, 2, true, false, false);   // lhax
++  case 375: return mem(ea_xu, 2, true, false, true);   // lhaux
++  case 407: return mem(ea_x, 2, false, true, false);   // sthx
++  case 439: return mem(ea_xu, 2, false, true, true);   // sthux
++  case 24:  // slw
++  case 536: // srw
++    return binop(ra, [&] {
++      // (rB & 0x20) ? 0 : rS shifted by rB & 0x1f
++      c.I32Const(0);
++      e.PushGPR(rs);
++      e.PushGPR(rb);
++      xo == 24 ? c.I32Shl() : c.I32ShrU();
++      e.PushGPR(rb);
++      c.I32Const(0x20);
++      c.I32And();
++      c.Select();  // select(0, shifted, rB & 0x20): 0 if the bit is set
++    });
++  case 26:  // cntlzw
++    return binop(ra, [&] {
++      e.PushGPR(rs);
++      c.I32Clz();
++    });
++  case 28:  // and
++  case 60:  // andc
++  case 124: // nor
++  case 284: // eqv
++  case 316: // xor
++  case 412: // orc
++  case 444: // or
++  case 476: // nand
++    return binop(ra, [&] {
++      e.PushGPR(rs);
++      e.PushGPR(rb);
++      if (xo == 60 || xo == 412)
++      {
++        c.I32Const(-1);
++        c.I32Xor();
++      }
++      switch (xo)
++      {
++      case 28: case 60: case 476: c.I32And(); break;
++      case 124: case 412: case 444: c.I32Or(); break;
++      default: c.I32Xor(); break;
++      }
++      if (xo == 124 || xo == 284 || xo == 476)
++      {
++        c.I32Const(-1);
++        c.I32Xor();
++      }
++    });
++  case 824:  // srawi
++  case 792:  // sraw
++  {
++    // rA = rS >> n (arithmetic); CA = rS < 0 && n > 0 && (rS << (32 - n)) != 0
++    e.PushGPR(rs);
++    c.LocalSet(Local::L_V);  // rs
++    if (xo == 824)
++    {
++      c.I32Const(inst.SH);
++    }
++    else
++    {
++      // sraw: amount = rB & 0x3f, anything >= 32 behaves like 31 for the
++      // result and carry (all bits shifted out)
++      e.PushGPR(rb);
++      c.I32Const(0x3f);
++      c.I32And();
++      c.LocalTee(Local::L_T);
++      c.I32Const(31);
++      c.LocalGet(Local::L_T);
++      c.I32Const(31);
++      c.I32LtU();
++      c.Select();
++    }
++    c.LocalSet(Local::L_T);  // n (0..31)
++    // carry: rs < 0 && (rs & ((1 << n) - 1)) != 0   [for sraw with amount >= 32: rs < 0]
++    c.LocalGet(Local::L_V);
++    c.I32Const(0);
++    c.I32LtS();
++    c.LocalGet(Local::L_V);
++    if (xo == 792)
++      c.I32Const(-1);  // amount >= 32: every bit is shifted out
++    c.I32Const(1);
++    c.LocalGet(Local::L_T);
++    c.I32Shl();
++    c.I32Const(1);
++    c.I32Sub();
++    if (xo == 792)
++    {
++      e.PushGPR(rb);
++      c.I32Const(0x20);
++      c.I32And();
++      c.Select();  // select(-1, (1 << n) - 1, rB & 0x20)
++    }
++    c.I32And();
++    c.I32Const(0);
++    c.I32Ne();
++    c.I32And();
++    c.LocalSet(Local::L_E);  // carry
++    // result: rs >> n, or rs >> 31 for amounts >= 32 (n is 31 then)
++    c.LocalGet(Local::L_V);
++    c.LocalGet(Local::L_T);
++    c.I32ShrS();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(ra, Local::L_V);
++    c.LocalGet(Local::L_E);
++    e.SetCarryFromStack();
++    if (inst.Rc)
++      e.UpdateCR0(Local::L_V);
++    return true;
++  }
++  case 922:  // extsh
++  case 954:  // extsb
++    return binop(ra, [&] {
++      e.PushGPR(rs);
++      xo == 922 ? c.I32Extend16S() : c.I32Extend8S();
++    });
++  default:
++    break;
++  }
++
++  if (inst.OE)
++    return false;
++
++  switch (xo & 0x1ff)  // XO-form: 9-bit opcode
++  {
++  case 266:  // add
++    return binop(rd, [&] {
++      e.PushGPR(ra);
++      e.PushGPR(rb);
++      c.I32Add();
++    });
++  case 40:  // subf: rB - rA
++    return binop(rd, [&] {
++      e.PushGPR(rb);
++      e.PushGPR(ra);
++      c.I32Sub();
++    });
++  case 104:  // neg
++    return binop(rd, [&] {
++      c.I32Const(0);
++      e.PushGPR(ra);
++      c.I32Sub();
++    });
++  case 235:  // mullw
++    return binop(rd, [&] {
++      e.PushGPR(ra);
++      e.PushGPR(rb);
++      c.I32Mul();
++    });
++  case 75:  // mulhw
++  case 11:  // mulhwu
++    return binop(rd, [&] {
++      e.PushGPR(ra);
++      (xo & 0x1ff) == 75 ? c.I64ExtendI32S() : c.I64ExtendI32U();
++      e.PushGPR(rb);
++      (xo & 0x1ff) == 75 ? c.I64ExtendI32S() : c.I64ExtendI32U();
++      c.I64Mul();
++      c.I64Const(32);
++      c.I64ShrU();
++      c.I32WrapI64();
++    });
++  case 491:  // divw
++  {
++    // overflow (b == 0 || (a == INT_MIN && b == -1)): rD = a < 0 ? -1 : 0
++    e.PushGPR(ra);
++    c.LocalSet(Local::L_T);
++    e.PushGPR(rb);
++    c.LocalSet(Local::L_E);
++    c.LocalGet(Local::L_E);
++    c.I32Eqz();
++    c.LocalGet(Local::L_T);
++    c.I32ConstU(0x80000000);
++    c.I32Eq();
++    c.LocalGet(Local::L_E);
++    c.I32Const(-1);
++    c.I32Eq();
++    c.I32And();
++    c.I32Or();
++    c.If(WasmJit::I32);
++    c.LocalGet(Local::L_T);
++    c.I32Const(31);
++    c.I32ShrS();
++    c.Else();
++    c.LocalGet(Local::L_T);
++    c.LocalGet(Local::L_E);
++    c.I32DivS();
++    c.End();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(rd, Local::L_V);
++    if (inst.Rc)
++      e.UpdateCR0(Local::L_V);
++    return true;
++  }
++  case 459:  // divwu: b == 0 -> 0
++    e.Use(ra);
++    e.PushGPR(rb);
++    c.LocalTee(Local::L_E);
++    c.If(WasmJit::I32);
++    e.PushGPR(ra);
++    c.LocalGet(Local::L_E);
++    c.I32DivU();
++    c.Else();
++    c.I32Const(0);
++    c.End();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(rd, Local::L_V);
++    if (inst.Rc)
++      e.UpdateCR0(Local::L_V);
++    return true;
++  case 10:   // addc: CA = carry(a, b)
++  case 138:  // adde: CA = carry(a, b) || carry(a + b, ca)
++  case 202:  // addze: rD = a + ca, CA = carry(a, ca)
++  case 8:    // subfc: rD = ~a + b + 1, CA = ~a == 0xFFFFFFFF || carry(b, ~a + 1)
++  case 136:  // subfe: rD = ~a + b + ca, CA = carry(~a, b) || carry(~a + b, ca)
++  {
++    const u32 op = xo & 0x1ff;
++    // Do it in 64 bits: carry is bit 32 of the full sum.
++    e.PushGPR(ra);
++    if (op == 8 || op == 136)
++    {
++      c.I32Const(-1);
++      c.I32Xor();
++    }
++    c.I64ExtendI32U();
++    if (op != 202)
++    {
++      e.PushGPR(rb);
++      c.I64ExtendI32U();
++      c.I64Add();
++    }
++    if (op == 8)
++    {
++      c.I64Const(1);
++      c.I64Add();
++    }
++    else if (op != 10)
++    {
++      e.PushCarry();
++      c.I64ExtendI32U();
++      c.I64Add();
++    }
++    c.LocalTee(Local::L_X);
++    c.I32WrapI64();
++    c.LocalSet(Local::L_V);
++    e.SetGPRFromLocal(rd, Local::L_V);
++    c.LocalGet(Local::L_X);
++    c.I64Const(32);
++    c.I64ShrU();
++    c.I32WrapI64();
++    e.SetCarryFromStack();
++    if (inst.Rc)
++      e.UpdateCR0(Local::L_V);
++    return true;
++  }
++  default:
++    return false;
++  }
++}
++
++s32 CachedInterpreter::WasmEntry(PowerPC::PowerPCState& ppc_state,
++                                 const WasmEntryOperands& operands)
++{
++  // Only reached when the block isn't compiled; ExecuteOneBlock handles it.
++  return sizeof(AnyCallback) + sizeof(operands);
++}
++
++s32 CachedInterpreter::WasmEntry(std::ostream& stream, const WasmEntryOperands& operands)
++{
++  fmt::println(stream, "WasmEntry(fn={}, calls={})", operands.fn, operands.calls);
++  return sizeof(AnyCallback) + sizeof(operands);
++}
++
++void CachedInterpreter::OnDestroyBlock(const JitBlock& block)
++{
++  if (!block.normalEntry)
++    return;
++  if (*reinterpret_cast<const AnyCallback*>(block.normalEntry) != AnyCallbackCast(WasmEntry))
++    return;
++  auto& entry =
++      *reinterpret_cast<WasmEntryOperands*>(block.normalEntry + sizeof(AnyCallback));
++  if (entry.fn != 0)
++    dolphin_wasm_jit_free(static_cast<int>(entry.fn));
++  entry.fn = 0;
++  entry.calls = WASM_JIT_NEVER;
++}
++
++void CachedInterpreter::CompileWasm(WasmEntryOperands& entry)
++{
++  using namespace WasmJit;
++  const int mode = dolphin_wasm_jit_mode();
++  if (mode <= 0)
++  {
++    entry.calls = WASM_JIT_NEVER;
++    return;
++  }
++  JitBlock& block = *entry.block;
++  const u8* p = reinterpret_cast<const u8*>(&entry) + sizeof(WasmEntryOperands);
++  const u8* const end = block.near_end;
++
++  const u32 ppc = static_cast<u32>(reinterpret_cast<uintptr_t>(&m_ppc_state));
++  const u32 off_pc = offsetof(PowerPC::PowerPCState, pc);
++  const u32 off_npc = offsetof(PowerPC::PowerPCState, npc);
++
++  auto& memory = m_system.GetMemory();
++  const Machine machine{
++      ppc,
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, cr) +
++                       offsetof(PowerPC::ConditionRegister, fields)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, msr)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_ca)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_so_ov)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, m_enable_dcache)),
++      static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data())),
++      static_cast<u32>(reinterpret_cast<uintptr_t>(m_system.GetMMU().GetDBATTable().data())),
++      static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetRAM())),
++      memory.GetRamMask(),
++      static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetEXRAM())),
++      memory.GetEXRAM() ? memory.GetExRamSizeReal() : 0,
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, pc)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, npc)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, spr)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, feature_flags)),
++      (block.feature_flags & FEATURE_FLAG_MSR_DR) != 0,
++  };
++  const bool branch_watch = m_system.GetPowerPC().GetBranchWatch().GetRecordingActive();
++
++  CodeWriter c;
++  Emitter emitter(c, machine);
++  auto call_callback = [&](AnyCallback cb, const u8* payload) {
++    // if (cb(ppc_state, payload) == 0) return;
++    emitter.Flush();
++    c.I32ConstU(ppc);
++    c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(payload)));
++    c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(cb)));
++    c.CallIndirect(TYPE_I_II);
++    c.I32Eqz();
++    c.If();
++    c.I32Const(0);
++    c.Return();
++    c.End();
++    emitter.Invalidate();  // callbacks may change any register
++  };
++
++  // Block exit: EndBlock<false> inline (pc = npc, downcount, no performance
++  // monitor), then block chaining: if there's time left in the slice, look
++  // the next block up in the dispatcher's map and return its compiled
++  // function (0: let the dispatcher handle it).
++  const bool can_chain = m_block_cache.UsesFastBlockMapFallback();
++  const bool tail_calls = dolphin_wasm_jit_tailcalls() != 0;
++  const u32 entry_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&entry));
++  const u32 fast_map =
++      static_cast<u32>(reinterpret_cast<uintptr_t>(m_block_cache.GetFastBlockMapFallback()));
++  const u32 wasm_entry_cb = static_cast<u32>(reinterpret_cast<uintptr_t>(AnyCallbackCast(WasmEntry)));
++  auto end_block_inline = [&](const EndBlockOperands<false>& op) {
++    emitter.Flush();
++    // pc = npc
++    c.I32ConstU(ppc);
++    c.I32ConstU(ppc);
++    c.I32Load(machine.npc);
++    c.I32Store(machine.pc);
++    // downcount -= n
++    c.I32ConstU(ppc);
++    c.I32ConstU(ppc);
++    c.I32Load(machine.downcount);
++    c.I32ConstU(op.downcount);
++    c.I32Sub();
++    c.LocalTee(L_T);
++    c.I32Store(machine.downcount);
++    if (!can_chain)
++    {
++      c.I32Const(0);
++      c.Return();
++      return;
++    }
++    c.LocalGet(L_T);
++    c.I32Const(0);
++    c.I32LeS();
++    c.If();
++    c.I32Const(0);
++    c.Return();
++    c.End();
++    // Tight loop: the block branches to itself. Run it again here, unless it
++    // was destroyed meanwhile (OnDestroyBlock clears entry.fn; the operands'
++    // memory is only reused at the next compile).
++    c.I32ConstU(ppc);
++    c.I32Load(machine.pc);
++    c.I32ConstU(block.effectiveAddress);
++    c.I32Eq();
++    c.I32ConstU(entry_addr);
++    c.I32Load(offsetof(WasmEntryOperands, fn));
++    c.I32Const(0);
++    c.I32Ne();
++    c.I32And();
++    c.BrIf(0);  // the function-wide loop
++    // block = fast_map[(pc >> 2) & mask]
++    c.I32ConstU(ppc);
++    c.I32Load(machine.pc);
++    c.LocalTee(L_V);
++    c.I32Const(2);
++    c.I32ShrU();
++    c.I32ConstU(JitBaseBlockCache::FAST_BLOCK_MAP_FALLBACK_MASK);
++    c.I32And();
++    c.I32Const(2);
++    c.I32Shl();
++    c.I32ConstU(fast_map);
++    c.I32Add();
++    c.I32Load();
++    c.LocalTee(L_E);
++    c.I32Eqz();
++    c.If();
++    c.I32Const(0);
++    c.Return();
++    c.End();
++    // block->effectiveAddress == pc && block->feature_flags == feature_flags
++    c.LocalGet(L_E);
++    c.I32Load(offsetof(JitBlockData, effectiveAddress));
++    c.LocalGet(L_V);
++    c.I32Ne();
++    c.LocalGet(L_E);
++    c.I32Load(offsetof(JitBlockData, feature_flags));
++    c.I32ConstU(ppc);
++    c.I32Load(machine.feature_flags);
++    c.I32Ne();
++    c.I32Or();
++    c.If();
++    c.I32Const(0);
++    c.Return();
++    c.End();
++    // entry = block->normalEntry; first callback must be WasmEntry
++    c.LocalGet(L_E);
++    c.I32Load(offsetof(JitBlockData, normalEntry));
++    c.LocalTee(L_E);
++    c.I32Load();
++    c.I32ConstU(wasm_entry_cb);
++    c.I32Ne();
++    c.If();
++    c.I32Const(0);
++    c.Return();
++    c.End();
++    c.LocalGet(L_E);
++    c.I32Load(sizeof(AnyCallback) + offsetof(WasmEntryOperands, fn));
++    if (tail_calls)
++    {
++      // next block compiled: jump into it; otherwise back to the dispatcher
++      c.LocalTee(L_E);
++      c.I32Eqz();
++      c.If();
++      c.I32Const(0);
++      c.Return();
++      c.End();
++      c.LocalGet(L_E);
++      c.ReturnCallIndirect(TYPE_I_V);
++    }
++    else
++    {
++      c.Return();
++    }
++  };
++
++  c.Loop();  // target of the tight-loop branch in end_block_inline
++  while (p < end)
++  {
++    const auto cb = *reinterpret_cast<const AnyCallback*>(p);
++    const u8* payload = p + sizeof(AnyCallback);
++
++    if (cb == AnyCallbackCast(Interpret<false>) || cb == AnyCallbackCast(Interpret<true>))
++    {
++      const auto& op = *reinterpret_cast<const InterpretOperands*>(payload);
++      if (cb == AnyCallbackCast(Interpret<true>))
++      {
++        c.I32ConstU(ppc);
++        c.I32ConstU(op.current_pc);
++        c.I32Store(off_pc);
++        c.I32ConstU(ppc);
++        c.I32ConstU(op.current_pc + 4);
++        c.I32Store(off_npc);
++      }
++      // func(interpreter, inst): the instruction is passed by pointer in the
++      // WebAssembly C ABI, and the operands hold a copy we can point at.
++      const auto call_interpreter = [&] {
++        c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(&op.interpreter)));
++        c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(&op.inst)));
++        c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(op.func)));
++        c.CallIndirect(TYPE_V_II);
++      };
++      if (!(mode >= 2 && EmitInline(emitter, op.inst, op.current_pc, branch_watch,
++                                     call_interpreter)))
++      {
++        emitter.Flush();
++        call_interpreter();
++        emitter.Invalidate();
++        dolphin_wasm_jit_note_fallback(PPCTables::GetInstructionName(op.inst, op.current_pc));
++      }
++      p = payload + sizeof(InterpretOperands);
++      continue;
++    }
++
++    std::size_t size;
++    if (cb == AnyCallbackCast(InterpretAndCheckExceptions<false>) ||
++        cb == AnyCallbackCast(InterpretAndCheckExceptions<true>))
++      size = sizeof(InterpretAndCheckExceptionsOperands);
++    else if (cb == AnyCallbackCast(EndBlock<false>))
++    {
++      size = sizeof(EndBlockOperands<false>);
++      if ((block.feature_flags & FEATURE_FLAG_PERFMON) == 0)
++      {
++        end_block_inline(*reinterpret_cast<const EndBlockOperands<false>*>(payload));
++        p = payload + size;
++        continue;
++      }
++    }
++    else if (cb == AnyCallbackCast(EndBlock<true>))
++      size = sizeof(EndBlockOperands<true>);
++    else if (cb == AnyCallbackCast(StartProfiledBlock))
++      size = sizeof(StartProfiledBlockOperands);
++    else if (cb == AnyCallbackCast(HLEFunction))
++      size = sizeof(HLEFunctionOperands);
++    else if (cb == AnyCallbackCast(WriteBrokenBlockNPC))
++      size = sizeof(WriteBrokenBlockNPCOperands);
++    else if (cb == AnyCallbackCast(CheckFPU) || cb == AnyCallbackCast(CheckBreakpoint))
++      size = sizeof(CheckHaltOperands);
++    else if (cb == AnyCallbackCast(CheckIdle))
++      size = sizeof(CheckIdleOperands);
++    else
++    {
++      WARN_LOG_FMT(DYNA_REC, "WebAssembly JIT: unknown callback in block {:08x}",
++                   block.effectiveAddress);
++      entry.calls = WASM_JIT_NEVER;
++      return;
++    }
++    call_callback(cb, payload);
++    p = payload + size;
++  }
++
++  c.End();        // loop
++  c.I32Const(0);  // not reached: every block ends in EndBlock
++  const std::vector<u8> module =
++      BuildModule({{L_I32_COUNT, I32}, {1, I64}}, c.bytes);
++  const int fn = dolphin_wasm_jit_install(module.data(), static_cast<int>(module.size()));
++  if (fn <= 0)
++  {
++    entry.calls = WASM_JIT_NEVER;
++    return;
++  }
++  entry.fn = static_cast<u32>(fn);
++}
++
++#endif  // __EMSCRIPTEN__
+diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
+index 6653297..95ceb68 100644
+--- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
++++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
+@@ -114,6 +114,9 @@ std::size_t CachedInterpreter::Disassemble(const JitBlock& block, std::ostream&
+       LOOKUP_KV(CachedInterpreter::CheckFPU),
+       LOOKUP_KV(CachedInterpreter::CheckBreakpoint),
+       LOOKUP_KV(CachedInterpreter::CheckIdle),
++#ifdef __EMSCRIPTEN__
++      LOOKUP_KV(CachedInterpreter::WasmEntry),
++#endif
+   });
+ 
+ #undef LOOKUP_KV
+diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
+new file mode 100644
+index 0000000..68edaed
+--- /dev/null
++++ b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
+@@ -0,0 +1,281 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Minimal WebAssembly binary encoder for the WebAssembly JIT tier
++// (CachedInterpreterWasm.cpp). It builds one tiny module per compiled block:
++//
++//   (import "e" "t" (table 0 funcref))             ; the main module's table
++//   (import "e" "m" (memory 0 65536 shared))       ; the main module's memory
++//   (func (export "f") (result i32) ...)            ; the block: next block's fn or 0
++//
++// Only the handful of instructions the JIT emits are provided.
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++namespace WasmJit
++{
++// Value types
++constexpr u8 I32 = 0x7f;
++constexpr u8 I64 = 0x7e;
++constexpr u8 F32 = 0x7d;
++constexpr u8 F64 = 0x7c;
++constexpr u8 VOID = 0x40;  // empty block type
++
++// Function types used by the JIT (index into the type section built below)
++enum TypeIndex : u32
++{
++  TYPE_V_V = 0,      // () -> ()                 the block function
++  TYPE_V_II = 1,     // (i32, i32) -> ()         Interpreter::Instruction(Interpreter&, inst*)
++  TYPE_I_II = 2,     // (i32, i32) -> i32        CachedInterpreter callbacks
++  TYPE_V_I = 3,      // (i32) -> ()
++  TYPE_I_I = 4,      // (i32) -> i32
++  TYPE_V_III = 5,    // (i32, i32, i32) -> ()
++  TYPE_I_III = 6,    // (i32, i32, i32) -> i32
++  TYPE_V_IIII = 7,   // (i32, i32, i32, i32) -> ()
++  TYPE_I_V = 8,      // () -> i32               the block function: next block or 0
++  TYPE_COUNT
++};
++
++class CodeWriter
++{
++public:
++  std::vector<u8> bytes;
++
++  void Byte(u8 b) { bytes.push_back(b); }
++  void U32(u32 v)
++  {
++    do
++    {
++      u8 b = v & 0x7f;
++      v >>= 7;
++      if (v)
++        b |= 0x80;
++      Byte(b);
++    } while (v);
++  }
++  void S32(s32 v)
++  {
++    bool more = true;
++    while (more)
++    {
++      u8 b = v & 0x7f;
++      v >>= 7;  // arithmetic shift
++      if ((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40)))
++        more = false;
++      else
++        b |= 0x80;
++      Byte(b);
++    }
++  }
++  void S64(s64 v)
++  {
++    bool more = true;
++    while (more)
++    {
++      u8 b = v & 0x7f;
++      v >>= 7;
++      if ((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40)))
++        more = false;
++      else
++        b |= 0x80;
++      Byte(b);
++    }
++  }
++  void Name(const char* s)
++  {
++    const size_t n = std::strlen(s);
++    U32(static_cast<u32>(n));
++    bytes.insert(bytes.end(), s, s + n);
++  }
++  void Append(const std::vector<u8>& v) { bytes.insert(bytes.end(), v.begin(), v.end()); }
++
++  // ---- instructions ----
++  void Unreachable() { Byte(0x00); }
++  void Block(u8 type = VOID) { Byte(0x02); Byte(type); }
++  void Loop(u8 type = VOID) { Byte(0x03); Byte(type); }
++  void If(u8 type = VOID) { Byte(0x04); Byte(type); }
++  void Else() { Byte(0x05); }
++  void End() { Byte(0x0b); }
++  void Br(u32 depth) { Byte(0x0c); U32(depth); }
++  void BrIf(u32 depth) { Byte(0x0d); U32(depth); }
++  void Return() { Byte(0x0f); }
++  void Call(u32 func) { Byte(0x10); U32(func); }
++  void CallIndirect(u32 type) { Byte(0x11); U32(type); U32(0); }
++  // Tail call (WebAssembly tail-call proposal)
++  void ReturnCallIndirect(u32 type) { Byte(0x13); U32(type); U32(0); }
++  void Drop() { Byte(0x1a); }
++  void Select() { Byte(0x1b); }
++  void LocalGet(u32 i) { Byte(0x20); U32(i); }
++  void LocalSet(u32 i) { Byte(0x21); U32(i); }
++  void LocalTee(u32 i) { Byte(0x22); U32(i); }
++
++  // memory access: align is log2, offset in bytes
++  void Mem(u8 op, u32 align, u32 offset) { Byte(op); U32(align); U32(offset); }
++  void I32Load(u32 off = 0) { Mem(0x28, 2, off); }
++  void I64Load(u32 off = 0) { Mem(0x29, 3, off); }
++  void F32Load(u32 off = 0) { Mem(0x2a, 2, off); }
++  void F64Load(u32 off = 0) { Mem(0x2b, 3, off); }
++  void I32Load8S(u32 off = 0) { Mem(0x2c, 0, off); }
++  void I32Load8U(u32 off = 0) { Mem(0x2d, 0, off); }
++  void I32Load16S(u32 off = 0) { Mem(0x2e, 1, off); }
++  void I32Load16U(u32 off = 0) { Mem(0x2f, 1, off); }
++  void I32Store(u32 off = 0) { Mem(0x36, 2, off); }
++  void I64Store(u32 off = 0) { Mem(0x37, 3, off); }
++  void F32Store(u32 off = 0) { Mem(0x38, 2, off); }
++  void F64Store(u32 off = 0) { Mem(0x39, 3, off); }
++  void I32Store8(u32 off = 0) { Mem(0x3a, 0, off); }
++  void I32Store16(u32 off = 0) { Mem(0x3b, 1, off); }
++
++  void I32Const(s32 v) { Byte(0x41); S32(v); }
++  void I32ConstU(u32 v) { I32Const(static_cast<s32>(v)); }
++  void I64Const(s64 v) { Byte(0x42); S64(v); }
++
++  void I32Eqz() { Byte(0x45); }
++  void I32Eq() { Byte(0x46); }
++  void I32Ne() { Byte(0x47); }
++  void I32LtS() { Byte(0x48); }
++  void I32LtU() { Byte(0x49); }
++  void I32GtS() { Byte(0x4a); }
++  void I32GtU() { Byte(0x4b); }
++  void I32LeS() { Byte(0x4c); }
++  void I32LeU() { Byte(0x4d); }
++  void I32GeS() { Byte(0x4e); }
++  void I32GeU() { Byte(0x4f); }
++  void I64Eqz() { Byte(0x50); }
++  void I64Ne() { Byte(0x52); }
++  void I64LtS() { Byte(0x53); }
++  void I64GtS() { Byte(0x55); }
++
++  void I32Clz() { Byte(0x67); }
++  void I32Add() { Byte(0x6a); }
++  void I32Sub() { Byte(0x6b); }
++  void I32Mul() { Byte(0x6c); }
++  void I32DivS() { Byte(0x6d); }
++  void I32DivU() { Byte(0x6e); }
++  void I32And() { Byte(0x71); }
++  void I32Or() { Byte(0x72); }
++  void I32Xor() { Byte(0x73); }
++  void I32Shl() { Byte(0x74); }
++  void I32ShrS() { Byte(0x75); }
++  void I32ShrU() { Byte(0x76); }
++  void I32Rotl() { Byte(0x77); }
++  void I32Rotr() { Byte(0x78); }
++
++  void I64Add() { Byte(0x7c); }
++  void I64Sub() { Byte(0x7d); }
++  void I64Mul() { Byte(0x7e); }
++  void I64And() { Byte(0x83); }
++  void I64Or() { Byte(0x84); }
++  void I64Shl() { Byte(0x86); }
++  void I64ShrS() { Byte(0x87); }
++  void I64ShrU() { Byte(0x88); }
++
++  void I32WrapI64() { Byte(0xa7); }
++  void I64ExtendI32S() { Byte(0xac); }
++  void I64ExtendI32U() { Byte(0xad); }
++  void I32Extend8S() { Byte(0xc0); }
++  void I32Extend16S() { Byte(0xc1); }
++};
++
++// Wraps a function body (locals + code) into a complete module.
++// `locals` lists extra local declarations as (count, type) pairs.
++inline std::vector<u8> BuildModule(const std::vector<std::pair<u32, u8>>& locals,
++                                   const std::vector<u8>& code)
++{
++  CodeWriter m;
++  // magic + version
++  const u8 header[] = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
++  m.bytes.insert(m.bytes.end(), header, header + sizeof(header));
++
++  auto section = [&m](u8 id, const CodeWriter& body) {
++    m.Byte(id);
++    m.U32(static_cast<u32>(body.bytes.size()));
++    m.Append(body.bytes);
++  };
++
++  // Type section
++  {
++    CodeWriter s;
++    s.U32(TYPE_COUNT);
++    auto functype = [&s](std::initializer_list<u8> params, std::initializer_list<u8> results) {
++      s.Byte(0x60);
++      s.U32(static_cast<u32>(params.size()));
++      for (u8 p : params)
++        s.Byte(p);
++      s.U32(static_cast<u32>(results.size()));
++      for (u8 r : results)
++        s.Byte(r);
++    };
++    functype({}, {});                        // TYPE_V_V
++    functype({I32, I32}, {});                // TYPE_V_II
++    functype({I32, I32}, {I32});             // TYPE_I_II
++    functype({I32}, {});                     // TYPE_V_I
++    functype({I32}, {I32});                  // TYPE_I_I
++    functype({I32, I32, I32}, {});           // TYPE_V_III
++    functype({I32, I32, I32}, {I32});        // TYPE_I_III
++    functype({I32, I32, I32, I32}, {});      // TYPE_V_IIII
++    functype({}, {I32});                     // TYPE_I_V
++    section(1, s);
++  }
++  // Import section: table and memory
++  {
++    CodeWriter s;
++    s.U32(2);
++    s.Name("e");
++    s.Name("t");
++    s.Byte(0x01);  // table
++    s.Byte(0x70);  // funcref
++    s.Byte(0x00);  // limits: min only
++    s.U32(0);
++    s.Name("e");
++    s.Name("m");
++    s.Byte(0x02);  // memory
++    s.Byte(0x03);  // limits: min + max, shared
++    s.U32(0);
++    s.U32(65536);
++    section(2, s);
++  }
++  // Function section: one function of type TYPE_I_V
++  {
++    CodeWriter s;
++    s.U32(1);
++    s.U32(TYPE_I_V);
++    section(3, s);
++  }
++  // Export section: "f"
++  {
++    CodeWriter s;
++    s.U32(1);
++    s.Name("f");
++    s.Byte(0x00);  // func
++    s.U32(0);
++    section(7, s);
++  }
++  // Code section
++  {
++    CodeWriter body;
++    body.U32(static_cast<u32>(locals.size()));
++    for (const auto& [count, type] : locals)
++    {
++      body.U32(count);
++      body.Byte(type);
++    }
++    body.Append(code);
++    body.End();
++
++    CodeWriter s;
++    s.U32(1);
++    s.U32(static_cast<u32>(body.bytes.size()));
++    s.Append(body.bytes);
++    section(10, s);
++  }
++  return std::move(m.bytes);
++}
++}  // namespace WasmJit
+diff --git a/Source/Core/Core/PowerPC/JitCommon/JitCache.h b/Source/Core/Core/PowerPC/JitCommon/JitCache.h
+index 8860a42..3a7abea 100644
+--- a/Source/Core/Core/PowerPC/JitCommon/JitCache.h
++++ b/Source/Core/Core/PowerPC/JitCommon/JitCache.h
+@@ -176,6 +176,10 @@ public:
+   // This might return nullptr if there is no such block.
+   JitBlock* GetBlockFromStartAddress(u32 em_address, CPUEmuFeatureFlags feature_flags);
+ 
++  // For the WebAssembly JIT's block chaining (looks blocks up itself).
++  JitBlock* const* GetFastBlockMapFallback() const { return m_fast_block_map_fallback.data(); }
++  bool UsesFastBlockMapFallback() const { return m_entry_points_ptr == nullptr; }
++
+   // Get the normal entry for the block associated with the current program
+   // counter. This will JIT code if necessary. (This is the reference
+   // implementation; high-performance JITs will want to use a custom
 diff --git a/Source/Core/DolphinLibretro/Boot.cpp b/Source/Core/DolphinLibretro/Boot.cpp
 index 6cee24f..66b2bc4 100644
 --- a/Source/Core/DolphinLibretro/Boot.cpp

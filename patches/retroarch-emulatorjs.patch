@@ -1,3 +1,19 @@
+diff --git a/Makefile.emulatorjs b/Makefile.emulatorjs
+index b5862b3..e95cc33 100644
+--- a/Makefile.emulatorjs
++++ b/Makefile.emulatorjs
+@@ -287,6 +287,11 @@ ifneq (,$(findstring ppsspp,$(TARGET)))
+   additional_libs = ffmpeg/libavcodec.a ffmpeg/libavformat.a ffmpeg/libavutil.a ffmpeg/libswresample.a ffmpeg/libswscale.a
+ endif
+ 
++# Dolphin's WebAssembly JIT adds the functions it compiles to the table.
++ifneq (,$(findstring dolphin,$(TARGET)))
++  LDFLAGS += -s ALLOW_TABLE_GROWTH=1 $(DOLPHIN_EXTRA_LDFLAGS)
++endif
++
+ ifeq ($(HAVE_STATIC_DUMMY),1)
+   DEFINES += -DHAVE_STATIC_DUMMY
+ else
 diff --git a/emulatorjs/build-emulatorjs.sh b/emulatorjs/build-emulatorjs.sh
 index 3c05ecf..f0cacec 100755
 --- a/emulatorjs/build-emulatorjs.sh

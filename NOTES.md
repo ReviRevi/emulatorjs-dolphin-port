@@ -73,12 +73,58 @@ function becomes a *runtime abort*. After each link, check:
 - "Failed to create shared context for shader compiling" warnings are expected: no shared
   GL contexts on the web, so shaders compile synchronously on the main thread (stutter).
 
+## WebAssembly JIT (Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp)
+
+A tier on top of the Cached Interpreter (Emscripten only):
+
+- Every block's callback list starts with a `WasmEntry` callback holding `{fn, calls, block}`.
+  `ExecuteOneBlock` counts runs; at `WASM_JIT_THRESHOLD` (16) the block is compiled.
+- `CompileWasm` walks the callback list and emits one WebAssembly function per block
+  (`WasmEmitter.h` builds the module: imports the main module's table + shared memory).
+  JS glue (`EM_JS`) does `new WebAssembly.Module` + `Instance`, puts the export in the table
+  (`-sALLOW_TABLE_GROWTH`, see the RetroArch patch) and returns the index; freed in
+  `OnDestroyBlock` (hooked into `CachedInterpreterBlockCache::DestroyBlock`).
+- The function returns the next block's table index (0 = back to the dispatcher). With
+  WebAssembly tail calls (detected at run time) it `return_call_indirect`s into it instead.
+  A block that branches to itself loops inside its own function.
+- Inline code (`EmitInline`): integer ALU / compare / rotate / shift / mul / div / carry ops,
+  D- and X-form loads and stores (u8/u16/u32, update forms) with a RAM fast path that mirrors
+  `MMU::ReadFromHardware`/`WriteToHardware` (BAT translation, RAM/EXRAM; page tables, MMIO,
+  locked L1, dcache emulation, page-crossing and odd cache-inhibited stores go to the
+  Interpreter), `b`/`bc`/`bclr`/`bcctr`, and `EndBlock` (no perf-monitor blocks).
+  Everything else calls the Interpreter's function (fallback).
+- GPRs are cached in locals per block; flushed before Interpreter calls/callbacks/exits.
+  Rule: never load a register for the first time inside a conditional path.
+- MSR.DR is a compile-time constant per block (blocks are keyed by DR/IR; MSR writers end blocks).
+- Only runs on the thread that compiled (tables are per thread): the web build runs the CPU on
+  the browser main thread (single-core mode).
+
+Controls / diagnostics (page JavaScript, in the emulator's frame):
+- `globalThis.DOLPHIN_WASM_JIT = 0 | 1 | 2` before the game starts: off / calls only / inline (default).
+- `EJS_emulator.Module.wasmJitBlocks`: blocks compiled. `EJS_emulator.Module.wasmJitFallbacks`:
+  per-instruction count of compiled call sites that still use the Interpreter (what to inline next).
+
+Test + benchmark: `test-content/cpubench` (green = 32 results identical to the native build of the
+same C; binary counter = iterations). `scripts/bench.mjs <mode> <frame>` reports emulated fps.
+Results in the build VM (2 vCPU, software WebGL), steady state:
+
+| Mode | cpubench emulated fps |
+|---|---|
+| Cached Interpreter (JIT off) | 23.1 |
+| + blocks compiled as calls | 23.4 |
+| + inline integer/load/store | 31.4 |
+| + inline branches, EndBlock, block chaining | 42.6 |
+| + register locals (no gain on this test) | 42.9 |
+| + self-loops, tail calls | 58.5 (display-capped at 60) |
+
+Next: floating point / paired singles (all Interpreter fallbacks today; most game code),
+`mtspr`/`mfspr`, `lmw`/`stmw`, CR logic ops, `fres`/`frsqrte` tables. Match Jit64's FP behaviour
+(no full FPSCR exception tracking), not the Interpreter's.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
-2. **Performance**: PowerPC → WebAssembly JIT. Model: flycast-wasm's SH4 dynarec
-   (decode to IR, emit wasm bytes, `WebAssembly.compile`, dispatch via `call_indirect`).
-   Dolphin's `CachedInterpreter` block/linking structure is the natural place to hook in.
+2. **Performance**: extend the WebAssembly JIT (see above) to floating point / paired singles.
 3. Audio: confirm DSP HLE audio actually plays (RWebAudio path); tune `audio_latency`.
 4. Wii: needs Wiimote mapping defaults in EmulatorJS and NAND/SYSCONF handling; untested.
 5. Large ISOs: EmulatorJS loads the whole game into MEMFS (RAM). Prefer RVZ/compressed
