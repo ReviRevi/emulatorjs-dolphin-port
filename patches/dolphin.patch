@@ -3316,6 +3316,68 @@ index a3f108e..73f84ff 100644
    return (void*)Libretro::Video::hw_render.get_proc_address(name.c_str());
  }
  
+diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
+index ff5402b..5701b3d 100644
+--- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
++++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
+@@ -271,14 +271,44 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+   glDepthRangef(near_depth, far_depth);
+ }
+ 
++void OGLGfx::BreakFeedbackLoops()
++{
++  // WebGL refuses any draw while a texture attached to the bound framebuffer is
++  // also bound to a texture unit the program's samplers use ("Feedback loop
++  // formed between Framebuffer and active Texture"), even if it isn't sampled.
++  // Desktop GL allows this. Dolphin leaves stale bindings, e.g. a texture-cache
++  // entry it later renders into: unbind those.
++  if (!m_current_framebuffer)
++    return;
++  const AbstractTexture* color = m_current_framebuffer->GetColorAttachment();
++  const AbstractTexture* depth = m_current_framebuffer->GetDepthAttachment();
++  if (!color && !depth)
++    return;
++  for (size_t i = 0; i < m_bound_textures.size(); i++)
++  {
++    const AbstractTexture* t = m_bound_textures[i];
++    if (!t || (t != color && t != depth))
++      continue;
++    glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + i));
++    glBindTexture(static_cast<const OGLTexture*>(t)->GetGLTarget(), 0);
++    m_bound_textures[i] = nullptr;
++  }
++}
++
+ void OGLGfx::Draw(u32 base_vertex, u32 num_vertices)
+ {
++#ifdef __EMSCRIPTEN__
++  BreakFeedbackLoops();
++#endif
+   glDrawArrays(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(), base_vertex,
+                num_vertices);
+ }
+ 
+ void OGLGfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
+ {
++#ifdef __EMSCRIPTEN__
++  BreakFeedbackLoops();
++#endif
+   if (g_ogl_config.bSupportsGLBaseVertex)
+   {
+     glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
+diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.h b/Source/Core/VideoBackends/OGL/OGLGfx.h
+index cad88fc..9faf991 100644
+--- a/Source/Core/VideoBackends/OGL/OGLGfx.h
++++ b/Source/Core/VideoBackends/OGL/OGLGfx.h
+@@ -82,6 +82,8 @@ public:
+ 
+   // Invalidates a cached texture binding. Required for texel buffers when they borrow the units.
+   void InvalidateTextureBinding(u32 index) { m_bound_textures[index] = nullptr; }
++  // WebGL: unbind textures that are attached to the current framebuffer.
++  void BreakFeedbackLoops();
+ 
+   // The shared framebuffer exists for copying textures when extensions are not available. It is
+   // slower, but the only way to do these things otherwise.
 diff --git a/Source/Core/VideoBackends/OGL/OGLMain.cpp b/Source/Core/VideoBackends/OGL/OGLMain.cpp
 index df0c28a..2b7af87 100644
 --- a/Source/Core/VideoBackends/OGL/OGLMain.cpp

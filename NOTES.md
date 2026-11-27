@@ -170,6 +170,14 @@ Emscripten, `OGLStagingTexture` keeps its data in CPU memory: readback does `glR
 (RGBA8, BGRA8 with an R/B swap, R32F via RGBA/FLOAT), uploads `glTexSubImage3D` from it.
 Before this, every EFB-to-RAM copy logged `readPixels: invalid format` and returned nothing.
 
+### WebGL feedback loops
+
+WebGL rejects a draw when a texture attached to the bound framebuffer is also bound to a texture
+unit the program samples from, even if the shader never reads it ("Feedback loop formed between
+Framebuffer and active Texture"). Dolphin leaves stale bindings (e.g. a texture-cache entry it
+later renders into). On Emscripten, `OGLGfx::Draw`/`DrawIndexed` call `BreakFeedbackLoops()`, which
+unbinds such textures first. Seen as a black screen after the Mario Superstar Baseball main menu.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
