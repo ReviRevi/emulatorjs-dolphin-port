@@ -3229,6 +3229,23 @@ index a3f108e..73f84ff 100644
    return (void*)Libretro::Video::hw_render.get_proc_address(name.c_str());
  }
  
+diff --git a/Source/Core/VideoBackends/OGL/OGLMain.cpp b/Source/Core/VideoBackends/OGL/OGLMain.cpp
+index df0c28a..2b7af87 100644
+--- a/Source/Core/VideoBackends/OGL/OGLMain.cpp
++++ b/Source/Core/VideoBackends/OGL/OGLMain.cpp
+@@ -121,7 +121,12 @@ bool VideoBackend::FillBackendInfo(GLContext* context)
+   g_backend_info.bSupports3DVision = false;
+   g_backend_info.bSupportsPostProcessing = true;
+   g_backend_info.bSupportsSSAA = true;
++#ifdef __EMSCRIPTEN__
++  // WebGL rejects glDepthRange(near > far) with INVALID_OPERATION; let VideoCommon flip it.
++  g_backend_info.bSupportsReversedDepthRange = false;
++#else
+   g_backend_info.bSupportsReversedDepthRange = true;
++#endif
+   g_backend_info.bSupportsLogicOp = true;
+   g_backend_info.bSupportsMultithreading = false;
+   g_backend_info.bSupportsCopyToVram = true;
 diff --git a/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp b/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
 index 2eec584..fae48f3 100644
 --- a/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
@@ -3269,3 +3286,27 @@ index deb005b..65a1ea1 100644
  constexpr u32 m_os = OS_ALL;
  #endif
  
+diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
+index ecdaf5e..ed60ca5 100644
+--- a/Source/Core/VideoCommon/VertexShaderManager.cpp
++++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
+@@ -224,7 +224,19 @@ bool VertexShaderManager::UseVertexDepthRange()
+ 
+   // We can't compute the depth range in the vertex shader if we don't support depth clamp.
+   if (!g_backend_info.bSupportsDepthClamp)
++  {
++#ifdef __EMSCRIPTEN__
++    // WebGL rejects an inverted glDepthRange (near > far) and keeps the old range, which can
++    // hide everything. Map the depth in the vertex shader instead; without depth clamp,
++    // geometry outside the console's depth range clips instead of clamping.
++    if (!g_backend_info.bSupportsReversedDepthRange &&
++        (xfmem.viewport.zRange < 0.0f || xfmem.viewport.zRange > xfmem.viewport.farZ))
++    {
++      return true;
++    }
++#endif
+     return false;
++  }
+ 
+   // We need a full depth range if a ztexture is used.
+   if (bpmem.ztex2.op != ZTexOp::Disabled && !bpmem.zcontrol.early_ztest)

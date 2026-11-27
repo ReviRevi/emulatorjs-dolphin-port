@@ -151,6 +151,15 @@ Bugs found this way: `psq_st` kept the second value in a local that address tran
 Next: `mfcr`/`mtcrf`/`mcrf`, CR logic ops, quantized integer psq types, `fres`/`frsqrte`,
 `lmw`/`stmw`, FPRs cached in locals.
 
+### WebGL depth range
+
+WebGL rejects `glDepthRange(near > far)` (INVALID_OPERATION, the old range stays), and it has no
+depth clamp. Games that use an inverted console depth range (`zRange < 0`, e.g. Mario Superstar
+Baseball's cutscenes) then drew nothing: black screen with audio running. On Emscripten,
+`VertexShaderManager::UseVertexDepthRange()` now maps depth in the vertex shader for those
+viewports (glDepthRange stays 1-MAX..1). Without depth clamp, geometry outside the console's
+depth range clips instead of clamping.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
