@@ -356,10 +356,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..667ddb6
+index 0000000..41de1d9
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2446 @@
+@@ -0,0 +1,2533 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -1904,6 +1904,7 @@ index 0000000..667ddb6
 +      e.PushGPR(rd);  // RS
 +      c.LocalSet(Local::L_V);
 +    }
++    const u32 loaded0 = e.loaded, dirty0 = e.dirty;
 +    e.Translate(size, store, 0);
 +    if (store)
 +    {
@@ -1919,6 +1920,9 @@ index 0000000..667ddb6
 +    c.End();  // $slow
 +    // Slow path: the Interpreter does the access from PowerPCState, so write
 +    // back what's only in locals; it may change rD (loads) and rA (update).
++    // The fast path's writes to rD/rA didn't happen on this path.
++    e.loaded = loaded0;
++    e.dirty = dirty0;
 +    e.Flush(true);
 +    fallback();
 +    if (!store)
@@ -2111,6 +2115,67 @@ index 0000000..667ddb6
 +  case 43: return mem(ea_du, 2, true, false, true);    // lhau
 +  case 44: return mem(ea_d, 2, false, true, false);    // sth
 +  case 45: return mem(ea_du, 2, false, true, true);    // sthu
++  case 46:  // lmw
++  case 47:  // stmw
++  {
++    const bool store = inst.OPCD == 47;
++    const u32 first = rd;
++    const u32 n = 32 - first;
++    if (store)
++      for (u32 r = first; r < 32; r++)
++        e.Use(r);
++    c.Block();  // $done
++    c.Block();  // $slow
++    ea_d();
++    c.LocalSet(Local::L_EA);
++    // unaligned or little-endian: the Interpreter raises the alignment exception
++    c.LocalGet(Local::L_EA);
++    c.I32Const(3);
++    c.I32And();
++    c.BrIf(0);
++    c.I32ConstU(e.m.ppc);
++    c.I32Load(e.m.msr);
++    c.I32Const(1);  // MSR.LE
++    c.I32And();
++    c.BrIf(0);
++    const u32 loaded0 = e.loaded, dirty0 = e.dirty;
++    e.Translate(4 * n, store, 0);  // whole range inside one page
++    for (u32 i = 0; i < n; i++)
++    {
++      if (store)
++      {
++        c.LocalGet(Local::L_HOST);
++        e.PushGPR(first + i);
++        e.Bswap32();
++        c.I32Store(4 * i);
++      }
++      else
++      {
++        e.SetGPR(first + i, [&] {
++          c.LocalGet(Local::L_HOST);
++          c.I32Load(4 * i);
++          e.Bswap32();
++        });
++      }
++    }
++    c.Br(1);
++    c.End();  // $slow
++    e.loaded = loaded0;
++    e.dirty = dirty0;
++    e.Flush(true);
++    fallback();
++    if (!store)
++      for (u32 r = first; r < 32; r++)
++        e.Reload(r);
++    c.End();  // $done
++    if (!store)
++    {
++      const u32 mask = first == 0 ? ~0u : ~((1u << first) - 1);
++      e.loaded |= mask;
++      e.dirty |= mask;
++    }
++    return true;
++  }
 +  case 31:
 +    break;
 +  default:
@@ -2259,6 +2324,28 @@ index 0000000..667ddb6
 +    e.SetCarryFromStack();
 +    if (inst.Rc)
 +      e.UpdateCR0(Local::L_V);
++    return true;
++  }
++  case 83:  // mfmsr
++  {
++    c.Block();
++    c.Block();
++    e.Use(rd);
++    c.I32ConstU(e.m.ppc);
++    c.I32Load(e.m.msr);
++    c.LocalTee(L_V);
++    c.I32Const(1 << 14);  // MSR.PR: privileged, the Interpreter raises the exception
++    c.I32And();
++    c.BrIf(0);
++    e.SetGPRFromLocal(rd, L_V);
++    c.Br(1);
++    c.End();
++    e.Flush(true);
++    fallback();
++    e.Reload(rd);
++    c.End();
++    e.loaded |= 1u << rd;
++    e.dirty |= 1u << rd;
 +    return true;
 +  }
 +  case 339:  // mfspr
@@ -3273,6 +3360,193 @@ index 2eec584..fae48f3 100644
      glBufferData(m_buffertype, used_size, m_pointer, GL_STREAM_DRAW);
    }
  
+diff --git a/Source/Core/VideoBackends/OGL/OGLTexture.cpp b/Source/Core/VideoBackends/OGL/OGLTexture.cpp
+index 003a7ec..fa23168 100644
+--- a/Source/Core/VideoBackends/OGL/OGLTexture.cpp
++++ b/Source/Core/VideoBackends/OGL/OGLTexture.cpp
+@@ -3,9 +3,14 @@
+ 
+ #include "VideoBackends/OGL/OGLTexture.h"
+ 
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
+ #include "Common/Assert.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/GL/GLUtil.h"
++#include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ 
+ #include "VideoBackends/OGL/OGLConfig.h"
+@@ -416,6 +421,11 @@ OGLStagingTexture::OGLStagingTexture(StagingTextureType type, const TextureConfi
+ 
+ OGLStagingTexture::~OGLStagingTexture()
+ {
++#ifdef __EMSCRIPTEN__
++  // Web: plain CPU memory, no GL buffer (see Create).
++  std::free(m_map_pointer);
++  return;
++#endif
+   if (m_fence != nullptr)
+     glDeleteSync(m_fence);
+   if (m_map_pointer)
+@@ -433,6 +443,18 @@ std::unique_ptr<OGLStagingTexture> OGLStagingTexture::Create(StagingTextureType
+ {
+   size_t stride = config.GetStride();
+   size_t buffer_size = stride * config.height;
++#ifdef __EMSCRIPTEN__
++  // WebGL can't map buffers for reading (Emscripten's glMapBufferRange rejects
++  // GL_MAP_READ_BIT, and needs INVALIDATE for writes). Keep staging data in CPU
++  // memory: readback goes through glReadPixels into it, uploads come from it.
++  {
++    char* ptr = static_cast<char*>(std::calloc(1, buffer_size));
++    if (!ptr)
++      return nullptr;
++    return std::unique_ptr<OGLStagingTexture>(
++        new OGLStagingTexture(type, config, 0, 0, buffer_size, ptr, stride));
++  }
++#endif
+   GLenum target =
+       type == StagingTextureType::Readback ? GL_PIXEL_PACK_BUFFER : GL_PIXEL_UNPACK_BUFFER;
+   GLuint buffer;
+@@ -490,6 +512,68 @@ void OGLStagingTexture::CopyFromTexture(const AbstractTexture* src,
+   ASSERT(dst_rect.left >= 0 && static_cast<u32>(dst_rect.right) <= m_config.width &&
+          dst_rect.top >= 0 && static_cast<u32>(dst_rect.bottom) <= m_config.height);
+ 
++#ifdef __EMSCRIPTEN__
++  {
++    // WebGL2 glReadPixels only takes RGBA/UNSIGNED_BYTE for normalized colour
++    // buffers and RGBA/FLOAT for float ones (EXT_color_buffer_float). Read in
++    // that form and convert into the staging layout.
++    const OGLTexture* gltex = static_cast<const OGLTexture*>(src);
++    const AbstractTextureFormat format = gltex->GetFormat();
++    const bool is_float = format == AbstractTextureFormat::R32F;
++    if (format != AbstractTextureFormat::RGBA8 && format != AbstractTextureFormat::BGRA8 &&
++        !is_float)
++    {
++      WARN_LOG_FMT(VIDEO, "Staging readback of format {} not supported on WebGL",
++                   static_cast<int>(format));
++      m_needs_flush = false;
++      return;
++    }
++    const int w = src_rect.GetWidth();
++    const int h = src_rect.GetHeight();
++    static std::vector<u8> temp;
++    temp.resize(static_cast<size_t>(w) * h * (is_float ? 16 : 4));
++    GetOGLGfx()->BindSharedReadFramebuffer();
++    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, gltex->GetGLTextureId(),
++                              src_level, src_layer);
++    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, 0, 0, 0);
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glReadPixels(src_rect.left, src_rect.top, w, h, GL_RGBA,
++                 is_float ? GL_FLOAT : GL_UNSIGNED_BYTE, temp.data());
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    GetOGLGfx()->RestoreFramebufferBinding();
++    const size_t stride = m_config.GetStride();
++    for (int y = 0; y < h; y++)
++    {
++      char* dst = m_map_pointer + (dst_rect.top + y) * stride + dst_rect.left * m_texel_size;
++      if (is_float)
++      {
++        const float* in = reinterpret_cast<const float*>(temp.data()) + static_cast<size_t>(y) * w * 4;
++        for (int x = 0; x < w; x++)
++          std::memcpy(dst + x * 4, &in[x * 4], 4);  // R channel
++      }
++      else
++      {
++        const u8* in = temp.data() + static_cast<size_t>(y) * w * 4;
++        if (format == AbstractTextureFormat::BGRA8)
++        {
++          for (int x = 0; x < w; x++)
++          {
++            dst[x * 4 + 0] = in[x * 4 + 2];
++            dst[x * 4 + 1] = in[x * 4 + 1];
++            dst[x * 4 + 2] = in[x * 4 + 0];
++            dst[x * 4 + 3] = in[x * 4 + 3];
++          }
++        }
++        else
++        {
++          std::memcpy(dst, in, static_cast<size_t>(w) * 4);
++        }
++      }
++    }
++    m_needs_flush = false;
++    return;
++  }
++#endif
+   // Unmap the buffer before writing when not using persistent mappings.
+   if (!UsePersistentStagingBuffers())
+     OGLStagingTexture::Unmap();
+@@ -565,6 +649,47 @@ void OGLStagingTexture::CopyToTexture(const MathUtil::Rectangle<int>& src_rect,
+   const OGLTexture* gltex = static_cast<const OGLTexture*>(dst);
+   const size_t src_offset = src_rect.top * m_config.GetStride() + src_rect.left * m_texel_size;
+   const size_t copy_size = src_rect.GetHeight() * m_config.GetStride();
++#ifdef __EMSCRIPTEN__
++  {
++    // Upload from CPU memory. WebGL has no GL_BGRA: swap to RGBA first.
++    const AbstractTextureFormat format = dst->GetFormat();
++    const void* data = m_map_pointer + src_offset;
++    static std::vector<u8> temp;
++    GLint row_length = m_config.width;
++    if (format == AbstractTextureFormat::BGRA8)
++    {
++      const int w = src_rect.GetWidth(), h = src_rect.GetHeight();
++      temp.resize(static_cast<size_t>(w) * h * 4);
++      for (int y = 0; y < h; y++)
++      {
++        const u8* in = reinterpret_cast<const u8*>(m_map_pointer) + src_offset +
++                       static_cast<size_t>(y) * m_config.GetStride();
++        u8* out = temp.data() + static_cast<size_t>(y) * w * 4;
++        for (int x = 0; x < w; x++)
++        {
++          out[x * 4 + 0] = in[x * 4 + 2];
++          out[x * 4 + 1] = in[x * 4 + 1];
++          out[x * 4 + 2] = in[x * 4 + 0];
++          out[x * 4 + 3] = in[x * 4 + 3];
++        }
++      }
++      data = temp.data();
++      row_length = w;
++    }
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++    const GLenum target = gltex->GetGLTarget();
++    glActiveTexture(GL_MUTABLE_TEXTURE_INDEX);
++    glBindTexture(target, gltex->GetGLTextureId());
++    glTexSubImage3D(target, 0, dst_rect.left, dst_rect.top, dst_layer, dst_rect.GetWidth(),
++                    dst_rect.GetHeight(), 1,
++                    format == AbstractTextureFormat::BGRA8 ? GL_RGBA :
++                                                             GetGLFormatForTextureFormat(format),
++                    GetGLTypeForTextureFormat(format), data);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    m_needs_flush = false;
++    return;
++  }
++#endif
+ 
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_buffer_name);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, m_config.width);
+@@ -629,6 +754,9 @@ bool OGLStagingTexture::Map()
+ {
+   if (m_map_pointer)
+     return true;
++#ifdef __EMSCRIPTEN__
++  return false;
++#endif
+ 
+   // Slow path, map the texture, unmap it later.
+   GLenum flags;
+@@ -649,6 +777,9 @@ void OGLStagingTexture::Unmap()
+   // No-op with persistent mapped buffers.
+   if (!m_map_pointer || UsePersistentStagingBuffers())
+     return;
++#ifdef __EMSCRIPTEN__
++  return;  // CPU memory stays "mapped"
++#endif
+ 
+   glBindBuffer(m_target, m_buffer_name);
+   glUnmapBuffer(m_target);
 diff --git a/Source/Core/VideoCommon/DriverDetails.cpp b/Source/Core/VideoCommon/DriverDetails.cpp
 index deb005b..65a1ea1 100644
 --- a/Source/Core/VideoCommon/DriverDetails.cpp

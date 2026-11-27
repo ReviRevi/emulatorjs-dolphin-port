@@ -148,8 +148,10 @@ a screenshot.
 Bugs found this way: `psq_st` kept the second value in a local that address translation reused
 (wrong ps1 stored; likely the black screen after Start in Mario Superstar Baseball).
 
+Also inline: `lmw`/`stmw` (whole range in one page), `mfmsr`.
+
 Next: `mfcr`/`mtcrf`/`mcrf`, CR logic ops, quantized integer psq types, `fres`/`frsqrte`,
-`lmw`/`stmw`, FPRs cached in locals.
+FPRs cached in locals.
 
 ### WebGL depth range
 
@@ -159,6 +161,14 @@ Baseball's cutscenes) then drew nothing: black screen with audio running. On Ems
 `VertexShaderManager::UseVertexDepthRange()` now maps depth in the vertex shader for those
 viewports (glDepthRange stays 1-MAX..1). Without depth clamp, geometry outside the console's
 depth range clips instead of clamping.
+
+### WebGL readback (EFB copies to RAM, EFB peeks)
+
+Emscripten's `glMapBufferRange` refuses `GL_MAP_READ_BIT`, and WebGL2 `glReadPixels` only takes
+RGBA/UNSIGNED_BYTE (normalized) or RGBA/FLOAT (float buffers), not GL_BGRA or GL_RED. On
+Emscripten, `OGLStagingTexture` keeps its data in CPU memory: readback does `glReadPixels` into it
+(RGBA8, BGRA8 with an R/B swap, R32F via RGBA/FLOAT), uploads `glTexSubImage3D` from it.
+Before this, every EFB-to-RAM copy logged `readPixels: invalid format` and returned nothing.
 
 ## Known issues / TODO (rough priority)
 
