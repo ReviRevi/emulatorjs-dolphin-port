@@ -4700,7 +4700,7 @@ index 159e6a6..361c500 100644
    Boot.cpp
    Host.cpp
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
-index 97ba667..b3d9fb0 100644
+index 97ba667..477b827 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp
 +++ b/Source/Core/DolphinLibretro/Main.cpp
 @@ -1,4 +1,8 @@
@@ -4749,7 +4749,7 @@ index 97ba667..b3d9fb0 100644
 +    // thread is parked: otherwise a save state (the site saves every 30 s) or
 +    // anything that flushes the GPU from the main thread waits on work only the
 +    // main thread can run, and the page freezes.
-+    system.GetFifo().RunGpuLoopUntilCPUIdle(50);
++    system.GetFifo().RunGpuLoopUntilCPUIdle(200);
 +#endif
    }
    else
@@ -7393,7 +7393,7 @@ index deb005b..65a1ea1 100644
  #endif
  
 diff --git a/Source/Core/VideoCommon/Fifo.cpp b/Source/Core/VideoCommon/Fifo.cpp
-index 42e3362..ae2f037 100644
+index 42e3362..c9b0cff 100644
 --- a/Source/Core/VideoCommon/Fifo.cpp
 +++ b/Source/Core/VideoCommon/Fifo.cpp
 @@ -3,6 +3,9 @@
@@ -7406,14 +7406,14 @@ index 42e3362..ae2f037 100644
  #include <atomic>
  #include <cstring>
  
-@@ -301,6 +304,20 @@ void FifoManager::RunGpuLoop()
+@@ -301,14 +304,37 @@ void FifoManager::RunGpuLoop()
  #ifdef __LIBRETRO__
          if (m_stop_gpu_loop_requested.load())
            m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
 +#endif
 +#ifdef __LIBRETRO__
 +        if (m_stop_when_cpu_idle &&
-+            (m_system.GetCPU().IsCPUThreadIdle() ||
++            ((m_system.GetCPU().IsCPUThreadIdle() && IsGpuFifoDrained()) ||
 +             Common::Timer::NowUs() >= m_stop_deadline_us))
 +          m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
 +#ifdef __EMSCRIPTEN__
@@ -7427,7 +7427,24 @@ index 42e3362..ae2f037 100644
  #endif
  
          // Run events from the CPU thread.
-@@ -401,12 +418,30 @@ void FifoManager::RunGpuLoop()
+         AsyncRequests::GetInstance()->PullEvents();
+ 
+         // Do nothing while paused
++#ifdef __LIBRETRO__
++        // ...except when draining at the end of a frame: the CPU thread pauses
++        // as soon as it ends the frame, often well ahead of the GPU. Leaving the
++        // rest of the FIFO for the next frame lets the CPU overwrite textures
++        // and vertex data before the GPU has read them (texture smearing).
++        if (!m_emu_running_state.IsSet() && !m_stop_when_cpu_idle)
++          return;
++#else
+         if (!m_emu_running_state.IsSet())
+           return;
++#endif
+ 
+         if (m_use_deterministic_gpu_thread)
+         {
+@@ -401,12 +427,41 @@ void FifoManager::RunGpuLoop()
            g_framebuffer_manager->RefreshPeekCache();
          }
        },
@@ -7444,9 +7461,20 @@ index 42e3362..ae2f037 100644
  }
  
 +#ifdef __LIBRETRO__
++bool FifoManager::IsGpuFifoDrained()
++{
++  if (m_use_deterministic_gpu_thread)
++    return m_video_buffer_seen_ptr >= m_video_buffer_write_ptr;
++  auto& command_processor = m_system.GetCommandProcessor();
++  auto& fifo = command_processor.GetFifo();
++  return command_processor.IsInterruptWaiting() ||
++         !fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ||
++         !fifo.CPReadWriteDistance.load(std::memory_order_relaxed) || AtBreakpoint(m_system);
++}
++
 +void FifoManager::RunGpuLoopUntilCPUIdle(int max_ms)
 +{
-+  if (m_system.GetCPU().IsCPUThreadIdle())
++  if (m_system.GetCPU().IsCPUThreadIdle() && IsGpuFifoDrained())
 +    return;
 +  m_stop_when_cpu_idle = true;
 +  m_stop_deadline_us = Common::Timer::NowUs() + static_cast<u64>(max_ms) * 1000;
@@ -7459,10 +7487,10 @@ index 42e3362..ae2f037 100644
  {
    if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
 diff --git a/Source/Core/VideoCommon/Fifo.h b/Source/Core/VideoCommon/Fifo.h
-index cff4e79..9b1b5f8 100644
+index cff4e79..bea114e 100644
 --- a/Source/Core/VideoCommon/Fifo.h
 +++ b/Source/Core/VideoCommon/Fifo.h
-@@ -77,6 +77,10 @@ public:
+@@ -77,6 +77,11 @@ public:
    void ResetVideoBuffer();
  #ifdef __LIBRETRO__
    void StopGpuLoop();
@@ -7470,10 +7498,11 @@ index cff4e79..9b1b5f8 100644
 +  // actually stopped for the frame (or max_ms passed), so nothing it queued is
 +  // left waiting for the main thread between retro_run calls.
 +  void RunGpuLoopUntilCPUIdle(int max_ms);
++  bool IsGpuFifoDrained();
  #endif
  
  private:
-@@ -93,6 +97,8 @@ private:
+@@ -93,6 +98,8 @@ private:
  #ifdef __LIBRETRO__
    // Set by StopGpuLoop(), so that a stop requested before RunGpuLoop() got going still ends it.
    std::atomic<bool> m_stop_gpu_loop_requested{false};

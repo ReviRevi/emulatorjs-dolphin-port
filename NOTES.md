@@ -474,3 +474,13 @@ FIFO, swap) that wait deadlocked and froze the tab. On emscripten, in dual
 core, on the main thread, the wait now runs the GPU loop in 2 ms slices
 (`WaitForCPUThreadIdle`). Not reproduced headless; written for reports of
 Gauntlet freezing at boot in dual core.
+
+### Dual core: drain the GPU FIFO at the end of each frame (texture smear)
+
+Smear and the Wind Waker post-cutscene crash appear only in dual core. The CPU
+thread pauses as soon as it ends a frame, often far ahead of the GPU, and the
+paused GPU loop skipped the rest of the FIFO ("do nothing while paused"). The
+next frame's CPU work then overwrote textures and vertex data the GPU hadn't
+read yet. `RunGpuLoopUntilCPUIdle` (after each frame, 200 ms cap) now keeps
+processing the FIFO while paused and only stops once the CPU is parked and
+the FIFO is drained (`IsGpuFifoDrained`).
