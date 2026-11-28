@@ -356,10 +356,28 @@ index e0880c6..fbafe8b 100644
  #include <fcntl.h>
  #include <net/if.h>
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp
-index 3ec24a3..3f1aa78 100644
+index 3ec24a3..ca3f8cd 100644
 --- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.cpp
-@@ -61,6 +61,30 @@ void CachedInterpreter::ExecuteOneBlock()
+@@ -39,6 +39,17 @@ void CachedInterpreter::Init()
+   ResetFreeMemoryRanges();
+ 
+   jo.enableBlocklink = false;
++#ifdef __EMSCRIPTEN__
++  // Longer blocks, like the native JITs: compile past conditional branches
++  // (they exit only when taken) and follow unconditional branches and calls.
++  // Block exits cost more than the code in short blocks.
++  if (WasmJitBlocksEnabled())
++  {
++    analyzer.SetOption(PPCAnalyst::PPCAnalyzer::OPTION_CONDITIONAL_CONTINUE);
++    analyzer.SetOption(PPCAnalyst::PPCAnalyzer::OPTION_BRANCH_FOLLOW);
++    analyzer.SetBranchFollowingEnabled(true);
++  }
++#endif
+ 
+   m_block_cache.Init();
+ 
+@@ -61,6 +72,30 @@ void CachedInterpreter::ExecuteOneBlock()
      return;
    }
  
@@ -390,7 +408,26 @@ index 3ec24a3..3f1aa78 100644
    auto& ppc_state = m_ppc_state;
    while (true)
    {
-@@ -354,6 +378,10 @@ bool CachedInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
+@@ -132,6 +167,18 @@ s32 CachedInterpreter::EndBlock(PowerPC::PowerPCState& ppc_state,
+   return 0;
+ }
+ 
++s32 CachedInterpreter::EndBlockIfTaken(PowerPC::PowerPCState& ppc_state,
++                                       const EndBlockIfTakenOperands& operands)
++{
++  if (ppc_state.npc == operands.fallthrough_pc)
++    return sizeof(AnyCallback) + sizeof(operands);
++  ppc_state.pc = ppc_state.npc;
++  ppc_state.downcount -= operands.downcount;
++  PowerPC::UpdatePerformanceMonitor(operands.downcount, operands.num_load_stores,
++                                    operands.num_fp_inst, ppc_state);
++  return 0;
++}
++
+ template <bool write_pc>
+ s32 CachedInterpreter::Interpret(PowerPC::PowerPCState& ppc_state,
+                                  const InterpretOperands& operands)
+@@ -354,6 +401,10 @@ bool CachedInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
    auto& cpu = m_system.GetCPU();
    auto& breakpoints = power_pc.GetBreakPoints();
  
@@ -401,11 +438,55 @@ index 3ec24a3..3f1aa78 100644
    if (IsProfilingEnabled())
      Write(StartProfiledBlock, {js.curBlock->profile_data.get()});
  
+@@ -409,7 +460,30 @@ bool CachedInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
+       if (op.branchIsIdleLoop)
+         Write(CheckIdle, {m_system.GetCoreTiming(), js.blockStart});
+       if (op.canEndBlock)
+-        WriteEndBlock();
++      {
++        const bool last = i + 1 >= code_block.m_num_instructions;
++        const UGeckoInstruction inst = op.inst;
++        const bool unconditional_bc = inst.OPCD == 16 && (inst.BO & BO_DONT_DECREMENT_FLAG) &&
++                                      (inst.BO & BO_DONT_CHECK_CONDITION);
++        const bool conditional_branch =
++            (inst.OPCD == 16 && !unconditional_bc) ||
++            (inst.OPCD == 19 && (inst.SUBOP10 == 16 || inst.SUBOP10 == 528) &&
++             !((inst.BO & BO_DONT_DECREMENT_FLAG) && (inst.BO & BO_DONT_CHECK_CONDITION)));
++        if (!last && (inst.OPCD == 18 || unconditional_bc) &&
++            m_code_buffer[i + 1].address == op.branchTo)
++        {
++          // followed branch: the block carries on at its target
++        }
++        else if (!last && conditional_branch && !IsProfilingEnabled())
++        {
++          Write(EndBlockIfTaken, {js.downcountAmount, js.numLoadStoreInst,
++                                  js.numFloatingPointInst, op.address + 4});
++        }
++        else
++        {
++          WriteEndBlock();
++        }
++      }
+     }
+   }
+   if (code_block.m_broken)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h
-index dd940e8..4d30dea 100644
+index dd940e8..5c6fa4c 100644
 --- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter.h
-@@ -54,6 +54,13 @@ public:
+@@ -22,6 +22,11 @@ enum class State;
+ }
+ class Interpreter;
+ 
++#ifdef __EMSCRIPTEN__
++// WebAssembly JIT on, with long blocks (DOLPHIN_WASM_JIT_LONGBLOCKS, default 1).
++bool WasmJitBlocksEnabled();
++#endif
++
+ class CachedInterpreter : public JitBase, public CachedInterpreterCodeBlock
+ {
+ public:
+@@ -54,6 +59,13 @@ public:
    std::size_t DisassembleFarCode(const JitBlock& block, std::ostream& stream) const override;
  
    JitBaseBlockCache* GetBlockCache() override { return &m_block_cache; }
@@ -419,7 +500,7 @@ index dd940e8..4d30dea 100644
    const char* GetName() const override { return "Cached Interpreter"; }
    const CommonAsmRoutinesBase* GetAsmRoutines() override { return nullptr; }
  
-@@ -72,6 +79,13 @@ private:
+@@ -72,6 +84,13 @@ private:
  
    void LogGeneratedCode() const;
  
@@ -433,7 +514,42 @@ index dd940e8..4d30dea 100644
    struct StartProfiledBlockOperands;
    template <bool profiled>
    struct EndBlockOperands;
-@@ -174,3 +188,15 @@ struct CachedInterpreter::CheckIdleOperands
+@@ -81,6 +100,7 @@ private:
+   struct WriteBrokenBlockNPCOperands;
+   struct CheckHaltOperands;
+   struct CheckIdleOperands;
++  struct EndBlockIfTakenOperands;
+ 
+   static s32 StartProfiledBlock(PowerPC::PowerPCState& ppc_state,
+                                 const StartProfiledBlockOperands& operands);
+@@ -110,6 +130,11 @@ private:
+   static s32 CheckBreakpoint(std::ostream& stream, const CheckHaltOperands& operands);
+   static s32 CheckIdle(PowerPC::PowerPCState& ppc_state, const CheckIdleOperands& operands);
+   static s32 CheckIdle(std::ostream& stream, const CheckIdleOperands& operands);
++  // Conditional branch in the middle of a block (OPTION_CONDITIONAL_CONTINUE):
++  // ends the block only if the branch was taken.
++  static s32 EndBlockIfTaken(PowerPC::PowerPCState& ppc_state,
++                             const EndBlockIfTakenOperands& operands);
++  static s32 EndBlockIfTaken(std::ostream& stream, const EndBlockIfTakenOperands& operands);
+ 
+   Common::RangeSizeSet<u8*> m_free_ranges;
+   CachedInterpreterBlockCache m_block_cache;
+@@ -135,6 +160,14 @@ struct CachedInterpreter::EndBlockOperands<true> : CachedInterpreter::EndBlockOp
+   JitBlock::ProfileData* profile_data;
+ };
+ 
++struct CachedInterpreter::EndBlockIfTakenOperands
++{
++  u32 downcount;
++  u32 num_load_stores;
++  u32 num_fp_inst;
++  u32 fallthrough_pc;  // npc when the branch wasn't taken
++};
++
+ struct CachedInterpreter::InterpretOperands
+ {
+   Interpreter& interpreter;
+@@ -174,3 +207,15 @@ struct CachedInterpreter::CheckIdleOperands
    CoreTiming::CoreTimingManager& core_timing;
    u32 idle_pc;
  };
@@ -475,10 +591,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..808b844
+index 0000000..475cb38
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2719 @@
+@@ -0,0 +1,2749 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -524,6 +640,7 @@ index 0000000..808b844
 +#include "Core/System.h"
 +#include "Core/Debugger/BranchWatch.h"
 +#include "Core/PowerPC/CachedInterpreter/WasmEmitter.h"
++#include "Common/GL/GLUtil.h"
 +#include "Core/PowerPC/Interpreter/Interpreter.h"
 +#include "Core/PowerPC/PPCTables.h"
 +#include "Core/PowerPC/PowerPC.h"
@@ -2977,8 +3094,12 @@ index 0000000..808b844
 +  const u32 fast_map =
 +      static_cast<u32>(reinterpret_cast<uintptr_t>(m_block_cache.GetFastBlockMapFallback()));
 +  const u32 wasm_entry_cb = static_cast<u32>(reinterpret_cast<uintptr_t>(AnyCallbackCast(WasmEntry)));
-+  auto end_block_inline = [&](const EndBlockOperands<false>& op) {
-+    emitter.Flush();
++  // loop_depth: how many blocks deep the function-wide loop is from here;
++  // in_branch: inside a conditional exit, where the fall-through path still
++  // needs the cached registers (flush but keep them dirty).
++  auto end_block_inline = [&](const EndBlockOperands<false>& op, u32 loop_depth = 0,
++                              bool in_branch = false) {
++    emitter.Flush(in_branch);
 +    // pc = npc
 +    c.I32ConstU(ppc);
 +    c.I32ConstU(ppc);
@@ -3017,7 +3138,7 @@ index 0000000..808b844
 +    c.I32Const(0);
 +    c.I32Ne();
 +    c.I32And();
-+    c.BrIf(0);  // the function-wide loop
++    c.BrIf(loop_depth);  // the function-wide loop
 +    // block = fast_map[(pc >> 2) & mask]
 +    c.I32ConstU(ppc);
 +    c.I32Load(machine.pc);
@@ -3137,6 +3258,24 @@ index 0000000..808b844
 +    }
 +    else if (cb == AnyCallbackCast(EndBlock<true>))
 +      size = sizeof(EndBlockOperands<true>);
++    else if (cb == AnyCallbackCast(EndBlockIfTaken))
++    {
++      size = sizeof(EndBlockIfTakenOperands);
++      if ((block.feature_flags & FEATURE_FLAG_PERFMON) == 0)
++      {
++        const auto& op = *reinterpret_cast<const EndBlockIfTakenOperands*>(payload);
++        // taken: npc != fall-through -> leave the block like EndBlock
++        c.I32ConstU(ppc);
++        c.I32Load(machine.npc);
++        c.I32ConstU(op.fallthrough_pc);
++        c.I32Ne();
++        c.If();
++        end_block_inline({op.downcount, op.num_load_stores, op.num_fp_inst}, 1, true);
++        c.End();
++        p = payload + size;
++        continue;
++      }
++    }
 +    else if (cb == AnyCallbackCast(StartProfiledBlock))
 +      size = sizeof(StartProfiledBlockOperands);
 +    else if (cb == AnyCallbackCast(HLEFunction))
@@ -3198,14 +3337,37 @@ index 0000000..808b844
 +  dolphin_print_text(out.c_str());
 +}
 +#endif
++
++#ifdef __EMSCRIPTEN__
++bool WasmJitBlocksEnabled()
++{
++  return dolphin_wasm_jit_mode() != 0 && WebGLDebugFlag("DOLPHIN_WASM_JIT_LONGBLOCKS", 1) != 0;
++}
++#endif
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
-index 6653297..95ceb68 100644
+index 6653297..8815b4e 100644
 --- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
-@@ -114,6 +114,9 @@ std::size_t CachedInterpreter::Disassemble(const JitBlock& block, std::ostream&
+@@ -33,6 +33,14 @@ s32 CachedInterpreter::EndBlock(std::ostream& stream, const EndBlockOperands<pro
+   return sizeof(AnyCallback) + sizeof(operands);
+ }
+ 
++s32 CachedInterpreter::EndBlockIfTaken(std::ostream& stream,
++                                       const EndBlockIfTakenOperands& operands)
++{
++  fmt::println(stream, "EndBlockIfTaken(downcount={}, fallthrough_pc=0x{:08x})",
++               operands.downcount, operands.fallthrough_pc);
++  return sizeof(AnyCallback) + sizeof(operands);
++}
++
+ template <bool write_pc>
+ s32 CachedInterpreter::Interpret(std::ostream& stream, const InterpretOperands& operands)
+ {
+@@ -114,6 +122,10 @@ std::size_t CachedInterpreter::Disassemble(const JitBlock& block, std::ostream&
        LOOKUP_KV(CachedInterpreter::CheckFPU),
        LOOKUP_KV(CachedInterpreter::CheckBreakpoint),
        LOOKUP_KV(CachedInterpreter::CheckIdle),
++      LOOKUP_KV(CachedInterpreter::EndBlockIfTaken),
 +#ifdef __EMSCRIPTEN__
 +      LOOKUP_KV(CachedInterpreter::WasmEntry),
 +#endif

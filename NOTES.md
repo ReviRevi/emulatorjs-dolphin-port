@@ -235,6 +235,16 @@ instead of `wasm-function[0]`. `EJS_emulator.Module._dolphin_disasm(0x80123456, 
 PowerPC instructions there (console). TTYD (2026-11-27): main thread 97% busy, 73% in compiled
 blocks: CPU-bound, unlike Mario Superstar Baseball (GPU-process-bound: draw-call count).
 
+### Long blocks (conditional continue + branch following)
+
+TTYD's hottest loop (0x8014505c, 16.5% of the time) was 5 blocks per iteration: every `beq` ended
+a block, and block exits (flush, downcount, map lookup, call) cost more than 3-5 instructions.
+With the WebAssembly JIT on, the analyzer now uses OPTION_CONDITIONAL_CONTINUE and
+OPTION_BRANCH_FOLLOW like Jit64: conditional branches become `EndBlockIfTaken` (exit only if
+npc != fall-through; inline in wasm, flushing registers but keeping them for the fall-through),
+followed `b`/`bl` don't end the block, and the callee's `blr` is skipped by the analyzer.
+fpbench: 34 -> 39 fps, 138 -> 65 blocks, same checksum. `DOLPHIN_WASM_JIT_LONGBLOCKS=0` reverts.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
