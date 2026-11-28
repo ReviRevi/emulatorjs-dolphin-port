@@ -407,9 +407,14 @@ from the CPU thread went through. Fix needed: audio (SYNC_PER_FRAME) is pushed f
 thread, but RetroArch's audio driver (RWebAudio*) is JS bound to the main thread ("Cannot read
 properties of null (reading 'sampleRate')" in the worker) - samples produced off the main thread
 are queued and handed to batch_cb at the end of retro_run (`Audio::DrainPendingAudio`).
+That crackled: a frame's samples arriving just after the hand-off waited a frame (bursts of two,
+then none). Now in dual core the CPU thread's NewField skips the push and retro_run mixes one
+frame's worth (`Stream::PushAudioForFrame`) on the main thread after each frame.
 The JIT compiles and runs blocks on the CPU thread (its own function table), so
 `Module.wasmJitBlocks` / failures are counted on the worker's Module: the overlay's `jit` line
 reads 0 in dual core. Headless: fpbench and brtest checksums match single core (WebGL and WebGPU).
+First real test (baseball): stadium load 82-84% (vs ~60%), gameplay unchanged at 50-60% - the
+threads don't overlap much in gameplay yet; needs a dual-core trace (main vs worker timelines).
 
 ## Known issues / TODO (rough priority)
 

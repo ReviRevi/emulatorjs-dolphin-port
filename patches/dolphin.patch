@@ -4392,7 +4392,7 @@ index 8860a42..3a7abea 100644
    // counter. This will JIT code if necessary. (This is the reference
    // implementation; high-performance JITs will want to use a custom
 diff --git a/Source/Core/DolphinLibretro/Audio.cpp b/Source/Core/DolphinLibretro/Audio.cpp
-index 04deefa..5285af7 100644
+index 04deefa..4e18385 100644
 --- a/Source/Core/DolphinLibretro/Audio.cpp
 +++ b/Source/Core/DolphinLibretro/Audio.cpp
 @@ -1,4 +1,9 @@
@@ -4484,7 +4484,21 @@ index 04deefa..5285af7 100644
    }
    else if (avail > 0)
    {
-@@ -286,7 +322,7 @@ void Stream::ProcessCallBack()
+@@ -226,6 +262,13 @@ void Stream::MixAndPush(unsigned int num_samples)
+ // Per frame sync: each field's samples go to the frontend from the CPU thread as the field ends,
+ void Stream::NewField()
+ {
++#ifdef __EMSCRIPTEN__
++  // Dual core: the CPU thread is a worker; retro_run mixes the frame's samples
++  // on the main thread instead (one frame per retro_run, so the frontend gets
++  // an even stream rather than bursts).
++  if (!emscripten_is_main_runtime_thread())
++    return;
++#endif
+   PushAudioForFrame();
+ }
+ 
+@@ -286,7 +329,7 @@ void Stream::ProcessCallBack()
      // Use frame time to decide how much to push
      unsigned to_mix = GetSamplesForFrame(m_sample_rate);
      m_mixer->Mix(m_buffer, to_mix);
@@ -4493,7 +4507,7 @@ index 04deefa..5285af7 100644
  
      return;
    }
-@@ -295,7 +331,7 @@ void Stream::ProcessCallBack()
+@@ -295,7 +338,7 @@ void Stream::ProcessCallBack()
    // Clamp to sane range
    to_mix = std::clamp(to_mix, MIN_SAMPLES, MAX_SAMPLES);
    m_mixer->Mix(m_buffer, to_mix);
@@ -4571,7 +4585,7 @@ index 159e6a6..361c500 100644
    Boot.cpp
    Host.cpp
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
-index 97ba667..989be33 100644
+index 97ba667..a1a23cb 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp
 +++ b/Source/Core/DolphinLibretro/Main.cpp
 @@ -1,4 +1,8 @@
@@ -4610,11 +4624,16 @@ index 97ba667..989be33 100644
    Libretro::Input::InitSensors();
    Libretro::Options::CheckForUpdatedVariables();
    Libretro::FrameTiming::CheckForFastForwarding();
-@@ -552,6 +569,9 @@ void retro_run(void)
+@@ -552,6 +569,14 @@ void retro_run(void)
    }
  
    RETRO_PERFORMANCE_STOP(dolphin_main_func);
 +#ifdef __EMSCRIPTEN__
++  if (system.IsDualCoreMode())
++  {
++    if (SoundStream* stream = system.GetSoundStream())
++      static_cast<Libretro::Audio::Stream*>(stream)->PushAudioForFrame();
++  }
 +  Libretro::Audio::DrainPendingAudio();
 +#endif
  
