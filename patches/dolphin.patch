@@ -53,10 +53,10 @@ index 66a074a..595001e 100644
    target_sources(common PRIVATE
      Logging/ConsoleListenerDroid.cpp
 diff --git a/Source/Core/Common/GL/GLUtil.h b/Source/Core/Common/GL/GLUtil.h
-index a2225ec..69c417c 100644
+index a2225ec..b2598f4 100644
 --- a/Source/Core/Common/GL/GLUtil.h
 +++ b/Source/Core/Common/GL/GLUtil.h
-@@ -12,6 +12,30 @@ class GLContext;
+@@ -12,6 +12,31 @@ class GLContext;
  // Texture which we use to not disturb the other bindings.
  constexpr GLenum GL_MUTABLE_TEXTURE_INDEX = GL_TEXTURE10;
  
@@ -77,6 +77,7 @@ index a2225ec..69c417c 100644
 +  unsigned texture_binds;
 +  unsigned program_binds;
 +  unsigned flushes;
++  unsigned shader_failures;
 +};
 +inline WebGLStats g_webgl_stats{};
 +#define WEBGL_STAT(field, n) (g_webgl_stats.field += (n))
@@ -3352,7 +3353,7 @@ index a3f108e..73f84ff 100644
  }
  
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-index ff5402b..50c3da8 100644
+index ff5402b..c945c2a 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 @@ -6,6 +6,9 @@
@@ -3365,7 +3366,7 @@ index ff5402b..50c3da8 100644
  #include "Common/Logging/LogManager.h"
  
  #include "VideoBackends/OGL/OGLConfig.h"
-@@ -271,14 +274,67 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+@@ -271,14 +274,68 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
    glDepthRangef(near_depth, far_depth);
  }
  
@@ -3374,7 +3375,8 @@ index ff5402b..50c3da8 100644
 +  Module.dolphinGLStatsPtr = ptr;
 +  Module.dolphinGLStatsNames = ["draws", "buffer_uploads", "buffer_kb", "texture_uploads",
 +                                "texture_kb", "shader_compiles", "program_links", "readbacks",
-+                                "efb_copies", "texture_binds", "program_binds", "flushes"];
++                                "efb_copies", "texture_binds", "program_binds", "flushes",
++                                "shader_failures"];
 +  Module.dolphinGLStats = function() {
 +    var o = {}, base = Module.dolphinGLStatsPtr >> 2;
 +    for (var i = 0; i < Module.dolphinGLStatsNames.length; i++)
@@ -3433,7 +3435,7 @@ index ff5402b..50c3da8 100644
    if (g_ogl_config.bSupportsGLBaseVertex)
    {
      glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
-@@ -450,6 +506,7 @@ void OGLGfx::Flush()
+@@ -450,6 +507,7 @@ void OGLGfx::Flush()
    // ensure all commands are sent to the GPU.
    // Otherwise the driver could batch several frames together.
    glFlush();
@@ -3441,7 +3443,7 @@ index ff5402b..50c3da8 100644
  }
  
  void OGLGfx::WaitForGPUIdle()
-@@ -644,6 +701,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
+@@ -644,6 +702,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
    if (m_bound_textures[index] == gl_texture)
      return;
  
@@ -3742,10 +3744,20 @@ index 003a7ec..4f65466 100644
    glBindBuffer(m_target, m_buffer_name);
    glUnmapBuffer(m_target);
 diff --git a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
-index 1dfd026..fc98897 100644
+index 1dfd026..ddd6d12 100644
 --- a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
 +++ b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
-@@ -93,6 +93,7 @@ void SHADER::SetProgramVariables()
+@@ -17,6 +17,9 @@
+ #include "Common/FileUtil.h"
+ #include "Common/GL/GLContext.h"
+ #include "Common/GL/GLUtil.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/Version.h"
+@@ -93,6 +96,7 @@ void SHADER::SetProgramVariables()
  
    // To set uniform blocks/uniforms, the program must be active. We restore the
    // current binding at the end of this method to maintain the invariant.
@@ -3753,7 +3765,7 @@ index 1dfd026..fc98897 100644
    glUseProgram(glprogid);
  
    // Bind UBO and texture samplers
-@@ -167,7 +168,8 @@ void SHADER::Bind() const
+@@ -167,7 +171,8 @@ void SHADER::Bind() const
    if (CurrentProgram != glprogid)
    {
      INCSTAT(g_stats.this_frame.num_shader_changes);
@@ -3763,7 +3775,7 @@ index 1dfd026..fc98897 100644
      CurrentProgram = glprogid;
    }
  }
-@@ -312,6 +314,7 @@ bool ProgramShaderCache::CompileComputeShader(SHADER& shader, std::string_view c
+@@ -312,6 +317,7 @@ bool ProgramShaderCache::CompileComputeShader(SHADER& shader, std::string_view c
    glAttachShader(shader.glprogid, shader_id);
    shader.SetProgramBindings(true);
    glLinkProgram(shader.glprogid);
@@ -3771,7 +3783,7 @@ index 1dfd026..fc98897 100644
  
    // original shaders aren't needed any more
    glDeleteShader(shader_id);
-@@ -342,6 +345,7 @@ GLuint ProgramShaderCache::CompileSingleShader(GLenum type, std::string_view cod
+@@ -342,6 +348,7 @@ GLuint ProgramShaderCache::CompileSingleShader(GLenum type, std::string_view cod
  
    glShaderSource(result, num_strings, src.data(), src_sizes.data());
    glCompileShader(result);
@@ -3779,7 +3791,60 @@ index 1dfd026..fc98897 100644
  
    if (!CheckShaderCompileResult(result, type, code))
    {
-@@ -621,6 +625,7 @@ PipelineProgram* ProgramShaderCache::GetPipelineProgram(const GLVertexFormat* ve
+@@ -353,6 +360,23 @@ GLuint ProgramShaderCache::CompileSingleShader(GLenum type, std::string_view cod
+   return result;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// Failed shaders make Dolphin skip those draws silently (no WebGL error), so
++// put them in the browser console with their source.
++EM_JS(void, dolphin_report_bad_shader, (const char* what, const char* log, const char* src,
++                                        int src_len), {
++  try {
++    var w = UTF8ToString(what), l = UTF8ToString(log), s = UTF8ToString(src, src_len);
++    console.error("[dolphin shader] " + w + " failed:\n" + l);
++    console.groupCollapsed("[dolphin shader] source (" + w + ")");
++    console.log(s);
++    console.groupEnd();
++    Module.dolphinBadShaders = Module.dolphinBadShaders || [];
++    if (Module.dolphinBadShaders.length < 20) Module.dolphinBadShaders.push({ what: w, log: l, source: s });
++  } catch (e) {}
++});
++#endif
++
+ bool ProgramShaderCache::CheckShaderCompileResult(GLuint id, GLenum type, std::string_view code)
+ {
+   GLint compileStatus;
+@@ -385,6 +409,13 @@ bool ProgramShaderCache::CheckShaderCompileResult(GLuint id, GLenum type, std::s
+     if (compileStatus != GL_TRUE)
+     {
+       ERROR_LOG_FMT(VIDEO, "{} failed compilation:\n{}", prefix, info_log);
++#ifdef __EMSCRIPTEN__
++      {
++        WEBGL_STAT(shader_failures, 1);
++        const std::string src = s_glsl_header + std::string(code);
++        dolphin_report_bad_shader(prefix, info_log.c_str(), src.data(), static_cast<int>(src.size()));
++      }
++#endif
+ 
+       std::string filename = VideoBackendBase::BadShaderFilename(prefix, num_failures++);
+       std::ofstream file;
+@@ -424,6 +455,14 @@ bool ProgramShaderCache::CheckProgramLinkResult(GLuint id, std::string_view vcod
+     if (linkStatus != GL_TRUE)
+     {
+       ERROR_LOG_FMT(VIDEO, "Program failed linking:\n{}", info_log);
++#ifdef __EMSCRIPTEN__
++      {
++        WEBGL_STAT(shader_failures, 1);
++        const std::string src = std::string(vcode) + "\n//----\n" + std::string(pcode);
++        dolphin_report_bad_shader("program link", info_log.c_str(), src.data(),
++                                  static_cast<int>(src.size()));
++      }
++#endif
+       std::string filename = VideoBackendBase::BadShaderFilename("p", num_failures++);
+       std::ofstream file;
+       File::OpenFStream(file, filename, std::ios_base::out);
+@@ -621,6 +660,7 @@ PipelineProgram* ProgramShaderCache::GetPipelineProgram(const GLVertexFormat* ve
      // Link program.
      prog->shader.SetProgramBindings(false);
      glLinkProgram(prog->shader.glprogid);
