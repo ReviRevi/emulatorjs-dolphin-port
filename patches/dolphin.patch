@@ -882,10 +882,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..227a48f
+index 0000000..26c5a9e
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2927 @@
+@@ -0,0 +1,2934 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -940,7 +940,7 @@ index 0000000..227a48f
 +#include "Core/PowerPC/PowerPC.h"
 +
 +// clang-format off
-+EM_JS(int, dolphin_wasm_jit_install, (const unsigned char* ptr, int len), {
++EM_JS(int, dolphin_wasm_jit_install, (const unsigned char* ptr, int len, unsigned addr), {
 +  try {
 +    var mod = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
 +    var inst = new WebAssembly.Instance(mod, { e: { t: wasmTable, m: wasmMemory } });
@@ -950,7 +950,13 @@ index 0000000..227a48f
 +    Module["wasmJitBlocks"] = (Module["wasmJitBlocks"] || 0) + 1;
 +    return idx;
 +  } catch (e) {
-+    err("Dolphin WebAssembly JIT: " + e);
++    // Counted and printed with console.error directly: EmulatorJS may not
++    // forward Emscripten's err() to the console.
++    Module["wasmJitFailed"] = (Module["wasmJitFailed"] || 0) + 1;
++    var list = Module["wasmJitFailures"] || (Module["wasmJitFailures"] = []);
++    var a = (addr >>> 0).toString(16);
++    if (list.length < 20) list.push(a + ": " + e);
++    if (list.length <= 5) console.error("Dolphin WebAssembly JIT: block " + a + ": " + e);
 +    return 0;
 +  }
 +});
@@ -3772,7 +3778,8 @@ index 0000000..227a48f
 +  std::snprintf(name, sizeof(name), "ppc_%08x", block.effectiveAddress);
 +  const std::vector<u8> module =
 +      BuildModule({{L_I32_COUNT, I32}, {L_I64_COUNT, I64}, {L_F64_COUNT, F64}}, c.bytes, name);
-+  const int fn = dolphin_wasm_jit_install(module.data(), static_cast<int>(module.size()));
++  const int fn = dolphin_wasm_jit_install(module.data(), static_cast<int>(module.size()),
++                                         block.effectiveAddress);
 +  if (fn <= 0)
 +  {
 +    entry.calls = WASM_JIT_NEVER;
