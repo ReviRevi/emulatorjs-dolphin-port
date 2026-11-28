@@ -53,10 +53,10 @@ index 66a074a..595001e 100644
    target_sources(common PRIVATE
      Logging/ConsoleListenerDroid.cpp
 diff --git a/Source/Core/Common/GL/GLUtil.cpp b/Source/Core/Common/GL/GLUtil.cpp
-index f447d55..5aeba5a 100644
+index f447d55..27fe8b7 100644
 --- a/Source/Core/Common/GL/GLUtil.cpp
 +++ b/Source/Core/Common/GL/GLUtil.cpp
-@@ -115,3 +115,16 @@ void EnablePrimitiveRestart(const GLContext* context)
+@@ -115,3 +115,29 @@ void EnablePrimitiveRestart(const GLContext* context)
    }
  }
  }  // namespace GLUtil
@@ -72,12 +72,25 @@ index f447d55..5aeba5a 100644
 +{
 +  return dolphin_debug_flag(name, def);
 +}
++EM_JS(void, dolphin_trace_line, (const char* line), { console.log("[gltrace] " + UTF8ToString(line)); });
++static unsigned s_trace_event = 0;
++bool WebGLTraceActive()
++{
++  static const int from = WebGLDebugFlag("DOLPHIN_GL_TRACE_FROM", -1);
++  static const int count = WebGLDebugFlag("DOLPHIN_GL_TRACE_COUNT", 300);
++  const unsigned n = s_trace_event++;
++  return from >= 0 && n >= static_cast<unsigned>(from) && n < static_cast<unsigned>(from + count);
++}
++void WebGLTrace(const char* line)
++{
++  dolphin_trace_line(line);
++}
 +#endif
 diff --git a/Source/Core/Common/GL/GLUtil.h b/Source/Core/Common/GL/GLUtil.h
-index a2225ec..a6cbc3a 100644
+index a2225ec..741d59b 100644
 --- a/Source/Core/Common/GL/GLUtil.h
 +++ b/Source/Core/Common/GL/GLUtil.h
-@@ -12,6 +12,36 @@ class GLContext;
+@@ -12,6 +12,41 @@ class GLContext;
  // Texture which we use to not disturb the other bindings.
  constexpr GLenum GL_MUTABLE_TEXTURE_INDEX = GL_TEXTURE10;
  
@@ -105,6 +118,11 @@ index a2225ec..a6cbc3a 100644
 +};
 +// Triage switch read once from globalThis[name] (a number), default `def`.
 +int WebGLDebugFlag(const char* name, int def);
++// WebGL: WEBGL_clip_cull_distance is available (gl_ClipDistance may be written).
++inline bool g_webgl_clip_distance = false;
++// GPU trace: console lines for draws [DOLPHIN_GL_TRACE_FROM, +DOLPHIN_GL_TRACE_COUNT).
++bool WebGLTraceActive();
++void WebGLTrace(const char* line);
 +inline WebGLStats g_webgl_stats{};
 +#define WEBGL_STAT(field, n) (g_webgl_stats.field += (n))
 +#else
@@ -250,6 +268,45 @@ index 5761687..f722f6b 100644
    PowerPC/ConditionRegister.cpp
    PowerPC/ConditionRegister.h
    PowerPC/Expression.cpp
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index 4f70022..d5f9e64 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -456,6 +456,17 @@ static void FifoPlayerThread(Core::System& system, const std::optional<std::stri
+ 
+     CPUSetInitialExecutionState(system);
+ 
++#ifdef __LIBRETRO__
++    // Single core: retro_run drives the injected FIFO core one frame at a time
++    // (CPUManager::RunSingleFrame); don't enter the blocking loop. The core
++    // has to outlive this function.
++    if (!system.IsDualCoreMode())
++    {
++      static std::unique_ptr<CPUCoreBase> s_fifo_cpu_core;
++      s_fifo_cpu_core = std::move(cpu_core);
++      return;
++    }
++#endif
+     system.GetCPU().Run();
+ 
+     system.GetPowerPC().InjectExternalCPUCore(nullptr);
+diff --git a/Source/Core/Core/FifoPlayer/FifoPlayer.cpp b/Source/Core/Core/FifoPlayer/FifoPlayer.cpp
+index f0c62d4..158d4ac 100644
+--- a/Source/Core/Core/FifoPlayer/FifoPlayer.cpp
++++ b/Source/Core/Core/FifoPlayer/FifoPlayer.cpp
+@@ -259,6 +259,12 @@ public:
+         break;
+ 
+       case CPU::State::Running:
++#ifdef __LIBRETRO__
++        // libretro runs one frame per retro_run (RunSingleFrame), and frame
++        // stepping stops at VI fields, which a FIFO log doesn't program: stop
++        // after each FIFO frame instead.
++        cpu.Break();
++#endif
+         break;
+       }
+     }
 diff --git a/Source/Core/Core/HW/DVD/AMMediaboard.cpp b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
 index fdafc56..c6839d1 100644
 --- a/Source/Core/Core/HW/DVD/AMMediaboard.cpp
@@ -3539,7 +3596,7 @@ index a3f108e..73f84ff 100644
  }
  
 diff --git a/Source/Core/VideoBackends/OGL/OGLConfig.cpp b/Source/Core/VideoBackends/OGL/OGLConfig.cpp
-index e20bf10..09d9f32 100644
+index e20bf10..f1fb113 100644
 --- a/Source/Core/VideoBackends/OGL/OGLConfig.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLConfig.cpp
 @@ -12,6 +12,7 @@
@@ -3550,12 +3607,19 @@ index e20bf10..09d9f32 100644
  #include "Common/GL/GLExtensions/GLExtensions.h"
  #include "Common/MsgHandler.h"
  
-@@ -26,6 +27,30 @@
+@@ -26,6 +27,37 @@
  #include "DolphinLibretro/Common/Options.h"
  #endif
  
 +#ifdef __EMSCRIPTEN__
 +#include <emscripten.h>
++EM_JS(int, dolphin_webgl_enable_ext, (const char* name), {
++  try {
++    return GLctx && GLctx.getExtension(UTF8ToString(name)) ? 1 : 0;
++  } catch (e) {
++    return 0;
++  }
++});
 +EM_JS(int, dolphin_webgl_enable_dual_source, (), {
 +  try {
 +    if (!GLctx || !GLctx.getExtension("WEBGL_blend_func_extended"))
@@ -3581,7 +3645,7 @@ index e20bf10..09d9f32 100644
  namespace OGL
  {
  void InitDriverInfo()
-@@ -287,6 +312,16 @@ bool PopulateConfig(GLContext* m_main_gl_context)
+@@ -287,6 +319,16 @@ bool PopulateConfig(GLContext* m_main_gl_context)
  
    g_backend_info.bSupportsDualSourceBlend = (GLExtensions::Supports("GL_ARB_blend_func_extended") ||
                                               GLExtensions::Supports("GL_EXT_blend_func_extended"));
@@ -3598,8 +3662,29 @@ index e20bf10..09d9f32 100644
    g_backend_info.bSupportsPrimitiveRestart =
        !DriverDetails::HasBug(DriverDetails::BUG_PRIMITIVE_RESTART) &&
        ((GLExtensions::Version() >= 310) || GLExtensions::Supports("GL_NV_primitive_restart"));
+@@ -394,6 +436,20 @@ bool PopulateConfig(GLContext* m_main_gl_context)
+     // TODO: Implement support for GL_EXT_clip_cull_distance when there is an extension for
+     // depth clamping.
+     g_backend_info.bSupportsDepthClamp = false;
++#ifdef __EMSCRIPTEN__
++    // WebGL has both: EXT_depth_clamp and WEBGL_clip_cull_distance. Without depth
++    // clamping, geometry at the edge of an oversized console depth range (zRange
++    // 16777216) is clipped away (Mario Superstar Baseball's menu UI). Clip
++    // distances emulate the console's near/far clipping when available; if not,
++    // such geometry is clamped instead of clipped. DOLPHIN_GL_DEPTHCLAMP=0 turns
++    // it off.
++    g_backend_info.bSupportsDepthClamp = WebGLDebugFlag("DOLPHIN_GL_DEPTHCLAMP", 1) != 0 &&
++                                         dolphin_webgl_enable_ext("EXT_depth_clamp") != 0;
++    g_webgl_clip_distance = g_backend_info.bSupportsDepthClamp &&
++                            dolphin_webgl_enable_ext("WEBGL_clip_cull_distance") != 0;
++    INFO_LOG_FMT(VIDEO, "WebGL depth clamp: {}, clip distances: {}",
++                 g_backend_info.bSupportsDepthClamp, g_webgl_clip_distance);
++#endif
+ 
+     // GLES does not support logic op.
+     g_backend_info.bSupportsLogicOp = false;
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-index ff5402b..472a7c0 100644
+index ff5402b..bd38e4f 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 @@ -6,6 +6,9 @@
@@ -3612,7 +3697,23 @@ index ff5402b..472a7c0 100644
  #include "Common/Logging/LogManager.h"
  
  #include "VideoBackends/OGL/OGLConfig.h"
-@@ -271,14 +274,74 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+@@ -180,8 +183,13 @@ OGLGfx::OGLGfx(std::unique_ptr<GLContext> main_gl_context, float backbuffer_scal
+ 
+   if (g_backend_info.bSupportsDepthClamp)
+   {
+-    glEnable(GL_CLIP_DISTANCE0);
+-    glEnable(GL_CLIP_DISTANCE1);
++#ifdef __EMSCRIPTEN__
++    if (g_webgl_clip_distance)
++#endif
++    {
++      glEnable(GL_CLIP_DISTANCE0);
++      glEnable(GL_CLIP_DISTANCE1);
++    }
+     glEnable(GL_DEPTH_CLAMP);
+   }
+ 
+@@ -271,14 +279,74 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
    glDepthRangef(near_depth, far_depth);
  }
  
@@ -3687,7 +3788,19 @@ index ff5402b..472a7c0 100644
    if (g_ogl_config.bSupportsGLBaseVertex)
    {
      glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
-@@ -450,6 +513,7 @@ void OGLGfx::Flush()
+@@ -387,7 +455,10 @@ void OGLGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorEn
+   if (zEnable)
+   {
+     glDepthMask(zEnable ? GL_TRUE : GL_FALSE);
+-    glClearDepthf(float(z & 0xFFFFFF) / 16777216.0f);
++    float clear_depth = float(z & 0xFFFFFF) / 16777216.0f;
++    if (!g_backend_info.bSupportsReversedDepthRange)
++      clear_depth = 1.0f - clear_depth;  // depth is stored as 1 - z (see ApplyDepthState)
++    glClearDepthf(clear_depth);
+     clear_mask |= GL_DEPTH_BUFFER_BIT;
+   }
+ 
+@@ -450,6 +521,7 @@ void OGLGfx::Flush()
    // ensure all commands are sent to the GPU.
    // Otherwise the driver could batch several frames together.
    glFlush();
@@ -3695,7 +3808,51 @@ index ff5402b..472a7c0 100644
  }
  
  void OGLGfx::WaitForGPUIdle()
-@@ -644,6 +708,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
+@@ -487,7 +559,11 @@ void OGLGfx::CheckForSurfaceResize()
+ void OGLGfx::BeginUtilityDrawing()
+ {
+   AbstractGfx::BeginUtilityDrawing();
+-  if (g_backend_info.bSupportsDepthClamp)
++  if (g_backend_info.bSupportsDepthClamp
++#ifdef __EMSCRIPTEN__
++      && g_webgl_clip_distance
++#endif
++  )
+   {
+     glDisable(GL_CLIP_DISTANCE0);
+     glDisable(GL_CLIP_DISTANCE1);
+@@ -497,7 +573,11 @@ void OGLGfx::BeginUtilityDrawing()
+ void OGLGfx::EndUtilityDrawing()
+ {
+   AbstractGfx::EndUtilityDrawing();
+-  if (g_backend_info.bSupportsDepthClamp)
++  if (g_backend_info.bSupportsDepthClamp
++#ifdef __EMSCRIPTEN__
++      && g_webgl_clip_distance
++#endif
++  )
+   {
+     glEnable(GL_CLIP_DISTANCE0);
+     glEnable(GL_CLIP_DISTANCE1);
+@@ -529,8 +609,17 @@ void OGLGfx::ApplyDepthState(const DepthState state)
+   if (m_current_depth_state == state)
+     return;
+ 
++#ifdef __EMSCRIPTEN__
++  // WebGL build: bSupportsReversedDepthRange is false (WebGL rejects glDepthRange(near > far)),
++  // so VideoCommon stores depth as 1 - z and the comparisons have to be flipped, as the D3D
++  // backend does. Without this every depth test was backwards (menus drawn in front of a
++  // background disappeared).
++  const GLenum glCmpFuncs[8] = {GL_NEVER, GL_GREATER,  GL_EQUAL,  GL_GEQUAL,
++                                GL_LESS,  GL_NOTEQUAL, GL_LEQUAL, GL_ALWAYS};
++#else
+   const GLenum glCmpFuncs[8] = {GL_NEVER,   GL_LESS,     GL_EQUAL,  GL_LEQUAL,
+                                 GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS};
++#endif
+ 
+   if (state.test_enable)
+   {
+@@ -644,6 +733,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
    if (m_bound_textures[index] == gl_texture)
      return;
  
@@ -3996,7 +4153,7 @@ index 003a7ec..4f65466 100644
    glBindBuffer(m_target, m_buffer_name);
    glUnmapBuffer(m_target);
 diff --git a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
-index 1dfd026..57a22b2 100644
+index 1dfd026..4df82a2 100644
 --- a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
 +++ b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
 @@ -17,6 +17,9 @@
@@ -4116,7 +4273,19 @@ index 1dfd026..57a22b2 100644
  
      // Restore VAO binding after linking.
      if (!s_is_shared_context && vao != s_last_VAO)
-@@ -747,6 +791,11 @@ void ProgramShaderCache::CreateHeader()
+@@ -692,6 +736,11 @@ void ProgramShaderCache::CreateHeader()
+     SupportedESPointSize = "";
+     break;
+   }
++#ifdef __EMSCRIPTEN__
++  // WEBGL_clip_cull_distance: gl_ClipDistance for the depth-clamp path.
++  if (g_webgl_clip_distance)
++    SupportedESPointSize += "\n#extension GL_ANGLE_clip_cull_distance : enable";
++#endif
+ 
+   switch (g_ogl_config.SupportedESTextureBuffer)
+   {
+@@ -747,6 +796,11 @@ void ProgramShaderCache::CreateHeader()
        g_ogl_config.SupportedMultisampleTexStorage != MultisampleTexStorageType::TexStorageNone;
  
    std::string binding_layout;
@@ -4128,7 +4297,7 @@ index 1dfd026..57a22b2 100644
    if (g_backend_info.bSupportsBindingLayout)
    {
      if (g_ogl_config.bSupportsExplicitLayoutInShader)
-@@ -786,6 +835,19 @@ void ProgramShaderCache::CreateHeader()
+@@ -786,6 +840,19 @@ void ProgramShaderCache::CreateHeader()
                       "#define IMAGE_BINDING(format, x) layout(format)\n";
    }
  
@@ -4148,6 +4317,54 @@ index 1dfd026..57a22b2 100644
    // TODO: actually define this if using 'bSupportsExplicitLayoutInShader'
    const std::string varying_location = "#define VARYING_LOCATION(x)\n";
  
+@@ -936,8 +1003,13 @@ bool SharedContextAsyncShaderCompiler::WorkerThreadInitWorkerThread(void* param)
+     glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+   if (g_backend_info.bSupportsDepthClamp)
+   {
+-    glEnable(GL_CLIP_DISTANCE0);
+-    glEnable(GL_CLIP_DISTANCE1);
++#ifdef __EMSCRIPTEN__
++    if (g_webgl_clip_distance)
++#endif
++    {
++      glEnable(GL_CLIP_DISTANCE0);
++      glEnable(GL_CLIP_DISTANCE1);
++    }
+     glEnable(GL_DEPTH_CLAMP);
+   }
+   if (g_backend_info.bSupportsPrimitiveRestart)
+diff --git a/Source/Core/VideoCommon/BPFunctions.cpp b/Source/Core/VideoCommon/BPFunctions.cpp
+index 134a14f..1c8597a 100644
+--- a/Source/Core/VideoCommon/BPFunctions.cpp
++++ b/Source/Core/VideoCommon/BPFunctions.cpp
+@@ -3,6 +3,11 @@
+ 
+ #include "VideoCommon/BPFunctions.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <fmt/format.h>
++#include "Common/GL/GLUtil.h"
++#endif
++
+ #include <algorithm>
+ #include <cmath>
+ #include <string_view>
+@@ -307,6 +312,15 @@ bool ClearScreen(FramebufferManager* frame_buffer_manager, const MathUtil::Recta
+                  bool color_enable, bool alpha_enable, bool z_enable, PixelFormat pixel_format,
+                  u32 clear_color_ar, u32 clear_color_gb, u32 clear_z_value)
+ {
++#ifdef __EMSCRIPTEN__
++  if (WebGLTraceActive())
++  {
++    const std::string line = fmt::format("clear ({},{})-({},{}) pe={:08x} cmode0={:08x} cmode1={:08x}",
++                                         rc.left, rc.top, rc.right, rc.bottom, bpmem.zcontrol.hex,
++                                         bpmem.blendmode.hex, bpmem.dstalpha.hex);
++    WebGLTrace(line.c_str());
++  }
++#endif
+   // (1): Disable unused color channels
+   if (pixel_format == PixelFormat::RGB8_Z24 || pixel_format == PixelFormat::RGB565_Z16 ||
+       pixel_format == PixelFormat::Z24)
 diff --git a/Source/Core/VideoCommon/DriverDetails.cpp b/Source/Core/VideoCommon/DriverDetails.cpp
 index deb005b..65a1ea1 100644
 --- a/Source/Core/VideoCommon/DriverDetails.cpp
@@ -4162,7 +4379,7 @@ index deb005b..65a1ea1 100644
  #endif
  
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
-index ed07589..bf837d3 100644
+index ed07589..6bcce6c 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
 +++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
 @@ -3,6 +3,10 @@
@@ -4176,40 +4393,121 @@ index ed07589..bf837d3 100644
  #include <algorithm>
  #include <chrono>
  #include <cmath>
-@@ -2163,6 +2167,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+@@ -2163,6 +2167,17 @@ void TextureCacheBase::CopyRenderTargetToTexture(
      float gamma, bool clamp_top, bool clamp_bottom,
      const CopyFilterCoefficients::Values& filter_coefficients)
  {
 +  WEBGL_STAT(efb_copies, 1);
++#ifdef __EMSCRIPTEN__
++  if (WebGLTraceActive())
++  {
++    const std::string line = fmt::format(
++        "efbcopy dst={:08x} fmt={} {}x{} depth={} src=({},{})-({},{}) intensity={} half={} pe={:08x}",
++        dstAddr, static_cast<int>(dstFormat), width, height, is_depth_copy, srcRect.left,
++        srcRect.top, srcRect.right, srcRect.bottom, isIntensity, scaleByHalf, bpmem.zcontrol.hex);
++    WebGLTrace(line.c_str());
++  }
++#endif
    // Emulation methods:
    //
    // - EFB to RAM:
+diff --git a/Source/Core/VideoCommon/UberShaderVertex.cpp b/Source/Core/VideoCommon/UberShaderVertex.cpp
+index 6f79564..b7aa04f 100644
+--- a/Source/Core/VideoCommon/UberShaderVertex.cpp
++++ b/Source/Core/VideoCommon/UberShaderVertex.cpp
+@@ -1,6 +1,9 @@
+ // Copyright 2015 Dolphin Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifdef __EMSCRIPTEN__
++#include "Common/GL/GLUtil.h"
++#endif
+ #include "VideoCommon/UberShaderVertex.h"
+ 
+ #include <utility>
+@@ -508,7 +511,11 @@ float3 load_input_float3_rawtex(uint vtx_offset, uint attr_offset) {{
+               "colors_1 = o.colors_1;\n");
+   }
+ 
+-  if (host_config.backend_depth_clamp)
++  if (host_config.backend_depth_clamp
++#ifdef __EMSCRIPTEN__
++      && g_webgl_clip_distance  // WebGL without WEBGL_clip_cull_distance: no clip distances
++#endif
++  )
+   {
+     out.Write("gl_ClipDistance[0] = clipDist0;\n"
+               "gl_ClipDistance[1] = clipDist1;\n");
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2d5e28b..d3eac99 100644
+index 2d5e28b..66c16d0 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
-@@ -3,6 +3,10 @@
+@@ -3,6 +3,12 @@
  
  #include "VideoCommon/VertexManagerBase.h"
  
 +#ifdef __EMSCRIPTEN__
++#include <fmt/format.h>
 +#include "Common/GL/GLUtil.h"
++#include "VideoCommon/XFMemory.h"
 +#endif
 +
  #include <array>
  #include <cmath>
  #include <memory>
-@@ -438,6 +442,10 @@ void VertexManagerBase::Flush()
+@@ -438,6 +444,25 @@ void VertexManagerBase::Flush()
      return;
  
    m_is_flushed = true;
 +#ifdef __EMSCRIPTEN__
 +  if (bpmem.blendmode.logic_op_enable && !bpmem.blendmode.blend_enable)
 +    WEBGL_STAT(logic_op_draws, 1);
++  if (WebGLTraceActive())
++  {
++    const auto& vp = xfmem.viewport;
++    const std::string line = fmt::format(
++        "draw prim={} idx={} gen={:08x} z={:08x} blend={:08x} dsta={:08x} pe={:08x} atest={:08x} "
++        "sc={:08x}-{:08x} tex0={:08x} tev0={:08x} cc0={:08x} ac0={:08x} vp=({:.1f},{:.1f} "
++        "o={:.1f},{:.1f} zr={:.0f} far={:.0f})",
++        static_cast<int>(m_current_primitive_type), m_index_generator.GetIndexLen(),
++        bpmem.genMode.hex, bpmem.zmode.hex, bpmem.blendmode.hex, bpmem.dstalpha.hex,
++        bpmem.zcontrol.hex, bpmem.alpha_test.hex, bpmem.scissorTL.hex, bpmem.scissorBR.hex,
++        bpmem.tex.GetUnit(0).texImage0.hex, bpmem.tevorders[0].hex,
++        bpmem.combiners[0].colorC.hex, bpmem.combiners[0].alphaC.hex, vp.wd, vp.ht, vp.xOrig,
++        vp.yOrig, vp.zRange, vp.farZ);
++    WebGLTrace(line.c_str());
++  }
 +#endif
  
    if (m_draw_counter == 0)
    {
+diff --git a/Source/Core/VideoCommon/VertexShaderGen.cpp b/Source/Core/VideoCommon/VertexShaderGen.cpp
+index ac09506..114a6de 100644
+--- a/Source/Core/VideoCommon/VertexShaderGen.cpp
++++ b/Source/Core/VideoCommon/VertexShaderGen.cpp
+@@ -1,6 +1,9 @@
+ // Copyright 2008 Dolphin Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifdef __EMSCRIPTEN__
++#include "Common/GL/GLUtil.h"
++#endif
+ #include "VideoCommon/VertexShaderGen.h"
+ 
+ #include "Common/Assert.h"
+@@ -877,7 +880,11 @@ ShaderCode GenerateVertexShaderCode(APIType api_type, const ShaderHostConfig& ho
+               "colors_1 = o.colors_1;\n");
+   }
+ 
+-  if (host_config.backend_depth_clamp)
++  if (host_config.backend_depth_clamp
++#ifdef __EMSCRIPTEN__
++      && g_webgl_clip_distance  // WebGL without WEBGL_clip_cull_distance: no clip distances
++#endif
++  )
+   {
+     out.Write("gl_ClipDistance[0] = clipDist0;\n"
+               "gl_ClipDistance[1] = clipDist1;\n");
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
 index ecdaf5e..79d7472 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp

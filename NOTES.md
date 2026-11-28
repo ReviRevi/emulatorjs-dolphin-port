@@ -208,6 +208,26 @@ ubershaders precompiled to compile every GX shader variant in headless Chrome: t
 currently fails (`case label type does not match switch init-expression type`), with or
 without dual-source; ubershaders are off by default.
 
+### Depth comparisons (the missing-menu bug)
+
+The first black-screen fix set `bSupportsReversedDepthRange = false` for Emscripten (WebGL rejects
+`glDepthRange(near > far)`). With that flag VideoCommon stores depth as 1 - z, and the backend
+must flip its depth comparisons (D3D's table: NEVER, GREATER, EQUAL, GEQUAL, LESS, NOTEQUAL,
+LEQUAL, ALWAYS). OGL never did, so every depth test was backwards: UI drawn in front of a
+background failed LEQUAL (Mario Superstar Baseball's menu). `OGLGfx::ApplyDepthState` now uses
+the flipped table on Emscripten and `ClearRegion` clears to 1 - z. Found by replaying a FIFO log.
+
+Also: depth clamping via `EXT_depth_clamp` (+ `WEBGL_clip_cull_distance` when present;
+`DOLPHIN_GL_DEPTHCLAMP=0` to disable), so oversized viewport depth ranges clamp like on desktop.
+
+### FIFO logs
+
+Desktop Dolphin's Tools > FIFO Player records a few frames of GPU commands (.dff). The browser
+build boots them (FifoPlayerThread doesn't enter its blocking loop in libretro single core; the
+FIFO CPU core breaks after each frame). `scripts/fifoplay.mjs file.dff out.png` plays one in
+headless Chrome. `DOLPHIN_GL_TRACE_FROM=N` (+ `DOLPHIN_GL_TRACE_COUNT`) logs draws, EFB copies
+and clears with their BP/XF state to the console as `[gltrace]`.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
