@@ -292,6 +292,54 @@ useProgram, bindTexture/bindSampler and uniform-buffer range rebinds. `DOLPHIN_G
 Remaining per-draw calls: one constants upload (bufferSubData) per changed section, texture binds,
 blend state. Versioning the constants buffer would only trade bufferSubData for bindBufferRange.
 
+## WebGPU backend (branch `webgpu`, experimental)
+
+`Source/Core/VideoBackends/WebGPU`: a new Dolphin video backend for the browser build, on with
+`DOLPHIN_WEBGPU=1` (jl-emu-globals). RetroArch still gets a WebGL context; the core renders with
+WebGPU and copies each finished frame into RetroArch's GL framebuffer.
+
+- **Split C++/JS.** `WGPUBackend.cpp` implements Dolphin's abstract renderer (textures, staging
+  textures, framebuffers, shaders, pipelines, vertex formats, Gfx, VertexManager) as thin handles;
+  `WGPURuntime.js` does the WebGPU work through small EM_JS stubs (no webgpu.h, so no Emscripten
+  upgrade). `scripts/gen_wgpu_embed.py` embeds the runtime and naga into `WGPUEmbedded.inc`
+  (generated, not in the patch; build.sh runs it).
+- **Device.** Requested at module start (`AutoKick` static initializer) because it's asynchronous;
+  by the time a game boots it's ready. Optional features used if present: dual-source-blending,
+  float32-filterable, texture-compression-bc, depth32float-stencil8.
+- **Shaders.** Dolphin generates Metal-style GLSL 4.5 (api_type Metal: same NDC/depth/origin
+  conventions as WebGPU). glslang preprocesses it (`SPIRV::PreprocessShader`), then JS rewrites
+  what WGSL can't express and naga (npm `naga-wasm`, 2 MB wasm, embedded) translates to WGSL:
+  combined image-samplers split into texture (binding 2n) + sampler (2n+1), including function
+  parameters; `bool` uniform-block members become uint; `isnan()` expanded; a lone `index = 0`
+  output loses its index. WGSL gets `diagnostic(off, derivative_uniformity)` because Dolphin samples
+  inside non-uniform branches. Dynamic sampler indexing, geometry/compute shaders, palette
+  conversion, logic ops, bbox, depth clamp, large points are reported unsupported.
+- **Binding.** Group 0: one uniform ring buffer bound three times with dynamic offsets (PS, VS, GS;
+  utility pipelines read the utility block at all three). Group 1: textures/samplers, layout taken
+  from the WGSL's declared bindings; bind groups cached per pipeline. A texture that's an attachment
+  of the current pass is replaced with a dummy (the EFB stays bound to unused samplers). Depth
+  textures are sampled through an r32float copy made with copyTextureToBuffer.
+- **Passes.** Begun lazily on the first draw after SetFramebuffer; whole-target clears become the
+  pass's loadOp (as Metal); copies and uploads end the pass. Uploads go through mapped staging
+  buffers inside the command encoder so they stay ordered with draws. Destroyed objects are kept
+  until the next submit.
+- **Readbacks** are asynchronous: StagingTexture::Map returns whatever has arrived (usually the
+  previous frame's data) instead of stalling.
+- **Present.** Default: copy the backbuffer to a mappable buffer, texImage2D it into a GL texture
+  when the map completes, blit into RetroArch's framebuffer (a frame or two of latency).
+  `DOLPHIN_WEBGPU_PRESENT=1` tries the GPU-only route (copy to a WebGPU canvas, texImage2D from
+  the canvas); in headless SwiftShader the canvas snapshot came back blank, untested on real GPUs.
+- **Testing.** Headless Chrome runs WebGPU on SwiftShader (`--enable-unsafe-webgpu
+  --use-webgpu-adapter=swiftshader --enable-features=Vulkan`), but WebGPU canvases don't show in
+  screenshots: read textures back with `Module.__wgpu._list()` / `_read(id)` (scripts/tex2png.py).
+  `Module.__wgpu.stats` counts draws, passes, submits, shader failures. `scripts/xlat.mjs` runs the
+  GLSL->WGSL path in node on dumped shaders. Menu FIFO: all 26 shaders translate, no validation
+  errors, picture matches the WebGL build.
+- **Known gaps.** Viewports are clamped to the target (WebGPU requires it), which distorts
+  geometry when a game's viewport extends off-screen; no MSAA; R16 textures map to r16float;
+  D24S8 depth can't be read back or sampled; ~7 draws per render pass on the menu (uploads and
+  copies end passes).
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.

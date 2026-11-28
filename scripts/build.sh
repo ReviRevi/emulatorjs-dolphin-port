@@ -13,6 +13,13 @@ if [ -z "${EMSCRIPTEN:-}" ]; then
   source "$WORK/emsdk/emsdk_env.sh" >/dev/null
 fi
 
+# 0. WebGPU backend: embed its JS runtime and the naga shader translator (npm naga-wasm)
+NAGA_DIR="$WORK/naga-wasm"
+if [ ! -f "$NAGA_DIR/package/dist/wasm/naga_bg.wasm" ]; then
+  mkdir -p "$NAGA_DIR" && (cd "$NAGA_DIR" && npm pack naga-wasm@30.2.0 >/dev/null && tar xzf naga-wasm-*.tgz)
+fi
+python3 "$REPO_DIR/scripts/gen_wgpu_embed.py" "$WORK/dolphin" "$NAGA_DIR/package"
+
 # 1. Dolphin -> static wasm libraries
 cd "$WORK/dolphin"
 mkdir -p build-wasm && cd build-wasm

@@ -539,7 +539,7 @@ index e2a3be8..80e44d2 100644
  #elif defined(__APPLE__)
        CLOCK_UPTIME_RAW;
 diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
-index 5761687..f722f6b 100644
+index 5761687..dc4a1c8 100644
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
 @@ -519,6 +519,8 @@ add_library(core
@@ -551,6 +551,14 @@ index 5761687..f722f6b 100644
    PowerPC/ConditionRegister.cpp
    PowerPC/ConditionRegister.h
    PowerPC/Expression.cpp
+@@ -695,6 +697,7 @@ PUBLIC
+   videonull
+   videoogl
+   videosoftware
++  $<$<BOOL:${EMSCRIPTEN}>:videowebgpu>
+ 
+ PRIVATE
+   FatFs
 diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
 index 4f70022..d5f9e64 100644
 --- a/Source/Core/Core/Core.cpp
@@ -4139,16 +4147,32 @@ index 159e6a6..361c500 100644
    Boot.cpp
    Host.cpp
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
-index 97ba667..c11221d 100644
+index 97ba667..3080081 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp
 +++ b/Source/Core/DolphinLibretro/Main.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,8 @@
  
 +#include "Common/GL/GLUtil.h"
++#ifdef __EMSCRIPTEN__
++#include "VideoBackends/WebGPU/WGPUBackend.h"
++#endif
  #include <cmath>
  #include <cstdint>
  #include <libretro.h>
-@@ -244,6 +245,13 @@ void retro_reset(void)
+@@ -149,6 +153,12 @@ cb(RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO, (void*)subsystems);
+ 
+ void retro_init(void)
+ {
++#ifdef __EMSCRIPTEN__
++  // Start creating the WebGPU device early: it's asynchronous and must be ready
++  // by the time the game boots.
++  if (WebGLDebugFlag("DOLPHIN_WEBGPU", 0) != 0)
++    WGPU::Kick();
++#endif
+   uint64_t serialization_quirks = RETRO_SERIALIZATION_QUIRK_MUST_INITIALIZE;
+   Libretro::environ_cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &serialization_quirks);
+ 
+@@ -244,6 +254,13 @@ void retro_reset(void)
  
  void retro_run(void)
  {
@@ -4162,6 +4186,59 @@ index 97ba667..c11221d 100644
    Libretro::Input::InitSensors();
    Libretro::Options::CheckForUpdatedVariables();
    Libretro::FrameTiming::CheckForFastForwarding();
+diff --git a/Source/Core/DolphinLibretro/Video.cpp b/Source/Core/DolphinLibretro/Video.cpp
+index a2366e7..03f9ae9 100644
+--- a/Source/Core/DolphinLibretro/Video.cpp
++++ b/Source/Core/DolphinLibretro/Video.cpp
+@@ -3,6 +3,11 @@
+ #include "VideoBackends/Vulkan/VulkanLoader.h"
+ #endif
+ #include "DolphinLibretro/Video.h"
++#ifdef __EMSCRIPTEN__
++#include "Common/GL/GLUtil.h"
++#include "VideoBackends/WebGPU/WGPUBackend.h"
++#include "VideoCommon/Present.h"
++#endif
+ 
+ #include <cassert>
+ #include <memory>
+@@ -207,6 +212,16 @@ bool SetHWRender(retro_hw_context_type type, const int version_major, const int
+       }
+       INFO_LOG_FMT(VIDEO, "Video - SetHWRender - using {}", api_name);
+       Config::SetBase(Config::MAIN_GFX_BACKEND, "OGL");
++#ifdef __EMSCRIPTEN__
++      // Experimental: render with WebGPU and hand the picture to RetroArch's GL
++      // framebuffer at present (globalThis.DOLPHIN_WEBGPU = 1).
++      if (WebGLDebugFlag("DOLPHIN_WEBGPU", 0) != 0)
++      {
++        WGPU::Kick();
++        Config::SetBase(Config::MAIN_GFX_BACKEND, "WebGPU");
++        VideoBackendBase::ActivateBackend("WebGPU");
++      }
++#endif
+       success = true;
+     }
+     else
+@@ -556,6 +571,19 @@ bool Video_InitializeBackend()
+     return false;
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  if (Config::Get(Config::MAIN_GFX_BACKEND) == "WebGPU")
++  {
++    WGPU::g_surface_width = static_cast<int>(GetAdjustedBaseWidth()) * efbScale;
++    WGPU::g_surface_height = static_cast<int>(GetAdjustedBaseHeight()) * efbScale;
++    WGPU::g_get_frontend_framebuffer = [] {
++      return static_cast<unsigned>(hw_render.get_current_framebuffer());
++    };
++    WGPU::g_frontend_present = [](int w, int h) {
++      video_cb(VideoCommon::g_is_duplicate_frame ? nullptr : RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
++    };
++  }
++#endif
+   // this calls InitializeGLExtensions, FillBackendInfo and InitializeShared internally
+   return g_video_backend->Initialize(wsi);
+ }
 diff --git a/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp b/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
 index a3f108e..580c156 100644
 --- a/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
@@ -4206,6 +4283,20 @@ index a3f108e..580c156 100644
    Libretro::Video::video_cb(VideoCommon::g_is_duplicate_frame ? nullptr : RETRO_HW_FRAME_BUFFER_VALID,
          m_backbuffer_width, m_backbuffer_height, 0);
  }
+diff --git a/Source/Core/VideoBackends/CMakeLists.txt b/Source/Core/VideoBackends/CMakeLists.txt
+index 0efc74f..b5f06c5 100644
+--- a/Source/Core/VideoBackends/CMakeLists.txt
++++ b/Source/Core/VideoBackends/CMakeLists.txt
+@@ -1,6 +1,9 @@
+ add_subdirectory(OGL)
+ add_subdirectory(Null)
+ add_subdirectory(Software)
++if(EMSCRIPTEN)
++  add_subdirectory(WebGPU)
++endif()
+ 
+ if(WIN32)
+   add_subdirectory(D3DCommon)
 diff --git a/Source/Core/VideoBackends/OGL/OGLConfig.cpp b/Source/Core/VideoBackends/OGL/OGLConfig.cpp
 index e20bf10..79e3036 100644
 --- a/Source/Core/VideoBackends/OGL/OGLConfig.cpp
@@ -5113,6 +5204,1531 @@ index 1dfd026..5075961 100644
      glEnable(GL_DEPTH_CLAMP);
    }
    if (g_backend_info.bSupportsPrimitiveRestart)
+diff --git a/Source/Core/VideoBackends/WebGPU/CMakeLists.txt b/Source/Core/VideoBackends/WebGPU/CMakeLists.txt
+new file mode 100644
+index 0000000..d0dff41
+--- /dev/null
++++ b/Source/Core/VideoBackends/WebGPU/CMakeLists.txt
+@@ -0,0 +1,11 @@
++add_library(videowebgpu
++  WGPUBackend.cpp
++  WGPUBackend.h
++)
++target_link_libraries(videowebgpu
++PUBLIC
++  common
++  videocommon
++PRIVATE
++  glslang
++)
+diff --git a/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp b/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp
+new file mode 100644
+index 0000000..f4b307f
+--- /dev/null
++++ b/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp
+@@ -0,0 +1,621 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoBackends/WebGPU/WGPUBackend.h"
++
++#include <algorithm>
++#include <cstring>
++
++#include <emscripten.h>
++
++#include "Common/GL/GLUtil.h"
++#include "Common/Logging/Log.h"
++#include "Common/MsgHandler.h"
++#include "Core/System.h"
++#include "VideoBackends/Null/NullBoundingBox.h"
++#include "VideoBackends/Null/PerfQuery.h"
++#include "VideoCommon/BPMemory.h"
++#include "VideoCommon/GeometryShaderManager.h"
++#include "VideoCommon/PixelShaderManager.h"
++#include "VideoCommon/RenderState.h"
++#include "VideoCommon/Spirv.h"
++#include "VideoCommon/VertexShaderGen.h"
++#include "VideoCommon/VertexShaderManager.h"
++#include "VideoCommon/VideoConfig.h"
++
++// Generated: kWgpuRuntime (WGPURuntime.js), kNagaGlue, kNagaWasmB64.
++#include "VideoBackends/WebGPU/WGPUEmbedded.inc"
++
++// ---------------------------------------------------------------------------
++// JS bridge
++// ---------------------------------------------------------------------------
++EM_JS(void, wgpu_install, (const char* runtime, const char* glue, const char* b64), {
++  if (Module.__wgpu) return;
++  var env = {
++    heap: function() { return HEAPU8; },
++    gl: function() { return typeof GLctx !== 'undefined' ? GLctx : null; },
++    GL: GL,
++    str: function(p) { return UTF8ToString(p); },
++    nagaGlue: UTF8ToString(glue),
++    nagaB64: UTF8ToString(b64)
++  };
++  Module.__wgpu = (new Function('env', UTF8ToString(runtime)))(env);
++  Module.__wgpu.kick();
++});
++EM_JS(int, wgpu_state, (), { return Module.__wgpu ? Module.__wgpu.state() : 0; });
++EM_JS(int, wgpu_feature, (int i), { return Module.__wgpu.feature(i); });
++EM_JS(int, wgpu_tex_create, (int w, int h, int layers, int levels, int fmt, int rt),
++      { return Module.__wgpu.texCreate(w, h, layers, levels, fmt, rt); });
++EM_JS(void, wgpu_tex_destroy, (int id), { Module.__wgpu.texDestroy(id); });
++EM_JS(void, wgpu_tex_upload,
++      (int id, int level, int layer, int x, int y, int w, int h, int row_length, const void* ptr,
++       int size),
++      { Module.__wgpu.texUpload(id, level, layer, x, y, w, h, row_length, ptr, size); });
++EM_JS(void, wgpu_tex_copy,
++      (int src, int sl, int slev, int sx, int sy, int dst, int dl, int dlev, int dx, int dy, int w,
++       int h),
++      { Module.__wgpu.texCopy(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h); });
++EM_JS(void, wgpu_set_texture, (int slot, int id), { Module.__wgpu.setTexture(slot, id); });
++EM_JS(void, wgpu_set_sampler, (int slot, unsigned tm0, unsigned tm1),
++      { Module.__wgpu.setSampler(slot, tm0 >>> 0, tm1 >>> 0); });
++EM_JS(int, wgpu_fb_create, (int color, int depth, const int* adds, int count),
++      { return Module.__wgpu.fbCreate(color, depth, adds, count); });
++EM_JS(void, wgpu_fb_destroy, (int id), { Module.__wgpu.fbDestroy(id); });
++EM_JS(void, wgpu_set_framebuffer, (int id, int mode, float r, float g, float b, float a, float z),
++      { Module.__wgpu.setFramebuffer(id, mode, r, g, b, a, z); });
++EM_JS(void, wgpu_set_viewport, (float x, float y, float w, float h, float n, float f),
++      { Module.__wgpu.setViewport(x, y, w, h, n, f); });
++EM_JS(void, wgpu_set_scissor, (int x, int y, int w, int h),
++      { Module.__wgpu.setScissor(x, y, w, h); });
++EM_JS(int, wgpu_shader_create, (int stage, const char* src),
++      { return Module.__wgpu.shaderCreate(stage, src); });
++EM_JS(void, wgpu_shader_destroy, (int id), { Module.__wgpu.shaderDestroy(id); });
++EM_JS(int, wgpu_vfmt_create, (const int* desc), { return Module.__wgpu.vfmtCreate(desc); });
++EM_JS(int, wgpu_pipeline_create,
++      (int vs, int fs, int vf, unsigned raster, unsigned depth, unsigned blend, unsigned fb,
++       int usage),
++      {
++        return Module.__wgpu.pipelineCreate(vs, fs, vf, raster >>> 0, depth >>> 0, blend >>> 0,
++                                            fb >>> 0, usage);
++      });
++EM_JS(void, wgpu_pipeline_destroy, (int id), { Module.__wgpu.pipelineDestroy(id); });
++EM_JS(void, wgpu_set_pipeline, (int id), { Module.__wgpu.setPipeline(id); });
++EM_JS(int, wgpu_vertices, (const void* p, int size, int stride),
++      { return Module.__wgpu.vertices(p, size, stride); });
++EM_JS(int, wgpu_indices, (const void* p, int count), { return Module.__wgpu.indices(p, count); });
++EM_JS(void, wgpu_uniforms, (int slot, const void* p, int size),
++      { Module.__wgpu.uniforms(slot, p, size); });
++EM_JS(void, wgpu_draw, (int base, int count), { Module.__wgpu.draw(base, count); });
++EM_JS(void, wgpu_draw_indexed, (int bi, int count, int bv),
++      { Module.__wgpu.drawIndexed(bi, count, bv); });
++EM_JS(int, wgpu_st_create, (), { return Module.__wgpu.stCreate(); });
++EM_JS(void, wgpu_st_destroy, (int id), { Module.__wgpu.stDestroy(id); });
++EM_JS(void, wgpu_st_copy_from,
++      (int sid, int tid, int layer, int level, int sx, int sy, int w, int h, int off, int stride),
++      { Module.__wgpu.stCopyFrom(sid, tid, layer, level, sx, sy, w, h, off, stride); });
++EM_JS(void, wgpu_st_flush, (int id), { Module.__wgpu.stFlush(id); });
++EM_JS(int, wgpu_st_read, (int id, void* p), { return Module.__wgpu.stRead(id, p); });
++EM_JS(void, wgpu_flush, (), { if (Module.__wgpu) Module.__wgpu.flush(); });
++EM_JS(void, wgpu_present, (int tid, unsigned fbo), { Module.__wgpu.present(tid, fbo); });
++
++namespace WGPU
++{
++int g_surface_width = 640;
++int g_surface_height = 528;
++unsigned (*g_get_frontend_framebuffer)() = nullptr;
++void (*g_frontend_present)(int width, int height) = nullptr;
++
++void Kick()
++{
++  wgpu_install(kWgpuRuntime, kNagaGlue, kNagaWasmB64);
++}
++// Device creation is asynchronous; start it while the page is still loading the
++// game so it's ready when the backend initializes.
++namespace
++{
++struct AutoKick
++{
++  AutoKick()
++  {
++    if (WebGLDebugFlag("DOLPHIN_WEBGPU", 0) != 0)
++      Kick();
++  }
++} s_auto_kick;
++}  // namespace
++
++bool IsReady()
++{
++  return wgpu_state() == 1;
++}
++
++static int TexId(const AbstractTexture* t)
++{
++  return t ? static_cast<const Texture*>(t)->GetId() : 0;
++}
++
++// ---------------------------------------------------------------------------
++// Textures
++// ---------------------------------------------------------------------------
++Texture::~Texture()
++{
++  wgpu_tex_destroy(m_id);
++}
++void Texture::CopyRectangleFromTexture(const AbstractTexture* src,
++                                       const MathUtil::Rectangle<int>& src_rect, u32 src_layer,
++                                       u32 src_level, const MathUtil::Rectangle<int>& dst_rect,
++                                       u32 dst_layer, u32 dst_level)
++{
++  wgpu_tex_copy(TexId(src), src_layer, src_level, src_rect.left, src_rect.top, m_id, dst_layer,
++                dst_level, dst_rect.left, dst_rect.top, src_rect.GetWidth(), src_rect.GetHeight());
++}
++void Texture::ResolveFromTexture(const AbstractTexture* src, const MathUtil::Rectangle<int>& rect,
++                                 u32 layer, u32 level)
++{
++  // No MSAA in this backend: a resolve is a plain copy.
++  wgpu_tex_copy(TexId(src), layer, level, rect.left, rect.top, m_id, layer, level, rect.left,
++                rect.top, rect.GetWidth(), rect.GetHeight());
++}
++void Texture::Load(u32 level, u32 width, u32 height, u32 row_length, const u8* buffer,
++                   size_t buffer_size, u32 layer)
++{
++  wgpu_tex_upload(m_id, level, layer, 0, 0, width, height, row_length, buffer,
++                  static_cast<int>(buffer_size));
++}
++
++StagingTexture::StagingTexture(StagingTextureType type, const TextureConfig& config)
++    : AbstractStagingTexture(type, config), m_id(wgpu_st_create())
++{
++  m_map_stride = config.GetStride();
++  m_data.resize(m_map_stride * config.height);
++}
++StagingTexture::~StagingTexture()
++{
++  wgpu_st_destroy(m_id);
++}
++void StagingTexture::CopyFromTexture(const AbstractTexture* src,
++                                     const MathUtil::Rectangle<int>& src_rect, u32 src_layer,
++                                     u32 src_level, const MathUtil::Rectangle<int>& dst_rect)
++{
++  const int off = static_cast<int>(dst_rect.top * m_map_stride + dst_rect.left * m_texel_size);
++  wgpu_st_copy_from(m_id, TexId(src), src_layer, src_level, src_rect.left, src_rect.top,
++                    src_rect.GetWidth(), src_rect.GetHeight(), off,
++                    static_cast<int>(m_map_stride));
++  m_needs_flush = true;
++}
++void StagingTexture::CopyToTexture(const MathUtil::Rectangle<int>& src_rect, AbstractTexture* dst,
++                                   const MathUtil::Rectangle<int>& dst_rect, u32 dst_layer,
++                                   u32 dst_level)
++{
++  const u8* p = m_data.data() + src_rect.top * m_map_stride + src_rect.left * m_texel_size;
++  wgpu_tex_upload(TexId(dst), dst_level, dst_layer, dst_rect.left, dst_rect.top,
++                  dst_rect.GetWidth(), dst_rect.GetHeight(),
++                  static_cast<int>(m_map_stride / m_texel_size), p,
++                  static_cast<int>(m_data.size() - (p - m_data.data())));
++}
++bool StagingTexture::Map()
++{
++  // Readbacks are asynchronous in WebGPU: this returns whatever has arrived so
++  // far (usually last frame's data) instead of stalling.
++  wgpu_st_read(m_id, m_data.data());
++  m_map_pointer = reinterpret_cast<char*>(m_data.data());
++  return true;
++}
++void StagingTexture::Unmap()
++{
++  m_map_pointer = nullptr;
++}
++void StagingTexture::Flush()
++{
++  wgpu_st_flush(m_id);
++  m_needs_flush = false;
++}
++
++Framebuffer::~Framebuffer()
++{
++  wgpu_fb_destroy(m_id);
++}
++Shader::~Shader()
++{
++  wgpu_shader_destroy(m_id);
++}
++Pipeline::~Pipeline()
++{
++  wgpu_pipeline_destroy(m_id);
++}
++
++VertexFormat::VertexFormat(const PortableVertexDeclaration& decl) : NativeVertexFormat(decl)
++{
++  int d[1 + 16 * 6] = {};
++  d[0] = decl.stride;
++  auto set = [&](ShaderAttrib loc, const AttributeFormat& f) {
++    const int i = static_cast<int>(loc);
++    int* a = &d[1 + i * 6];
++    a[0] = i;
++    a[1] = static_cast<int>(f.type) >= 4 ? 4 : static_cast<int>(f.type);
++    a[2] = f.components;
++    a[3] = f.offset;
++    a[4] = f.enable;
++    a[5] = f.integer;
++  };
++  set(ShaderAttrib::Position, decl.position);
++  for (int i = 0; i < 3; i++)
++    set(ShaderAttrib::Normal + i, decl.normals[i]);
++  for (int i = 0; i < 2; i++)
++    set(ShaderAttrib::Color0 + i, decl.colors[i]);
++  for (int i = 0; i < 8; i++)
++    set(ShaderAttrib::TexCoord0 + i, decl.texcoords[i]);
++  set(ShaderAttrib::PositionMatrix, decl.posmtx);
++  m_id = wgpu_vfmt_create(d);
++}
++
++// ---------------------------------------------------------------------------
++// Gfx
++// ---------------------------------------------------------------------------
++Gfx::Gfx() = default;
++Gfx::~Gfx()
++{
++  m_backbuffer_fb.reset();
++  m_backbuffer.reset();
++  wgpu_flush();
++}
++
++std::unique_ptr<AbstractTexture> Gfx::CreateTexture(const TextureConfig& config,
++                                                    std::string_view name)
++{
++  const int id = wgpu_tex_create(config.width, config.height, config.layers, config.levels,
++                                 static_cast<int>(config.format), config.IsRenderTarget());
++  if (!id)
++    return nullptr;
++  return std::make_unique<Texture>(config, id);
++}
++std::unique_ptr<AbstractStagingTexture> Gfx::CreateStagingTexture(StagingTextureType type,
++                                                                  const TextureConfig& config)
++{
++  return std::make_unique<StagingTexture>(type, config);
++}
++std::unique_ptr<AbstractFramebuffer>
++Gfx::CreateFramebuffer(AbstractTexture* color, AbstractTexture* depth,
++                       std::vector<AbstractTexture*> additional)
++{
++  std::vector<int> adds;
++  for (auto* t : additional)
++    adds.push_back(TexId(t));
++  const AbstractTexture* any = color ? color : depth;
++  const int id = wgpu_fb_create(TexId(color), TexId(depth), adds.data(),
++                                static_cast<int>(adds.size()));
++  return std::make_unique<Framebuffer>(
++      color, depth, std::move(additional),
++      color ? color->GetFormat() : AbstractTextureFormat::Undefined,
++      depth ? depth->GetFormat() : AbstractTextureFormat::Undefined, any->GetWidth(),
++      any->GetHeight(), id);
++}
++
++// Same conventions as the Metal backend (GLSL 4.5 with explicit sets), so the
++// shared shader generators produce code we can translate to WGSL.
++static constexpr std::string_view SHADER_HEADER = R"(#version 450 core
++#define ATTRIBUTE_LOCATION(x) layout(location = x)
++#define FRAGMENT_OUTPUT_LOCATION(x) layout(location = x)
++#define FRAGMENT_OUTPUT_LOCATION_INDEXED(x, y) layout(location = x, index = y)
++#define UBO_BINDING(packing, x) layout(packing, set = 0, binding = (x - 1))
++#define SAMPLER_BINDING(x) layout(set = 1, binding = x)
++#define TEXEL_BUFFER_BINDING(x) layout(set = 1, binding = (x + 8))
++#define SSBO_BINDING(x) layout(std430, set = 2, binding = x)
++#define VARYING_LOCATION(x) layout(location = x)
++#define FORCE_EARLY_Z layout(early_fragment_tests) in
++#define API_METAL 1
++#define float2 vec2
++#define float3 vec3
++#define float4 vec4
++#define uint2 uvec2
++#define uint3 uvec3
++#define uint4 uvec4
++#define int2 ivec2
++#define int3 ivec3
++#define int4 ivec4
++#define frac fract
++#define lerp mix
++#define gl_VertexID gl_VertexIndex
++#define gl_InstanceID gl_InstanceIndex
++)";
++
++std::unique_ptr<AbstractShader> Gfx::CreateShaderFromSource(ShaderStage stage,
++                                                            std::string_view source,
++                                                            VideoCommon::ShaderIncluder* includer,
++                                                            std::string_view name)
++{
++  std::string full(SHADER_HEADER);
++  full.append(source);
++  const EShLanguage lang = stage == ShaderStage::Vertex   ? EShLangVertex :
++                           stage == ShaderStage::Geometry ? EShLangGeometry :
++                           stage == ShaderStage::Pixel    ? EShLangFragment :
++                                                            EShLangCompute;
++  auto pp = SPIRV::PreprocessShader(lang, full);
++  if (!pp)
++  {
++    ERROR_LOG_FMT(VIDEO, "WebGPU: preprocessing failed for shader '{}'", name);
++    return nullptr;
++  }
++  const int id = wgpu_shader_create(static_cast<int>(stage), pp->c_str());
++  if (!id)
++  {
++    ERROR_LOG_FMT(VIDEO, "WebGPU: shader '{}' failed to translate", name);
++    return nullptr;
++  }
++  return std::make_unique<Shader>(stage, id);
++}
++std::unique_ptr<AbstractShader> Gfx::CreateShaderFromBinary(ShaderStage, const void*, size_t,
++                                                            std::string_view)
++{
++  return nullptr;
++}
++std::unique_ptr<NativeVertexFormat>
++Gfx::CreateNativeVertexFormat(const PortableVertexDeclaration& vtx_decl)
++{
++  return std::make_unique<VertexFormat>(vtx_decl);
++}
++std::unique_ptr<AbstractPipeline> Gfx::CreatePipeline(const AbstractPipelineConfig& config,
++                                                      const void*, size_t)
++{
++  auto sid = [](const AbstractShader* s) {
++    return s ? static_cast<const Shader*>(s)->GetId() : 0;
++  };
++  const int vf = config.vertex_format ?
++                     static_cast<const VertexFormat*>(config.vertex_format)->GetId() :
++                     0;
++  const int usage = config.usage == AbstractPipelineUsage::Utility ? 2 :
++                    config.usage == AbstractPipelineUsage::GXUber ? 1 :
++                                                                    0;
++  const int id = wgpu_pipeline_create(sid(config.vertex_shader), sid(config.pixel_shader), vf,
++                                      config.rasterization_state.hex, config.depth_state.hex,
++                                      config.blending_state.hex, config.framebuffer_state.hex,
++                                      usage);
++  if (!id)
++    return nullptr;
++  return std::make_unique<Pipeline>(config, id);
++}
++
++void Gfx::SetPipeline(const AbstractPipeline* pipeline)
++{
++  wgpu_set_pipeline(pipeline ? static_cast<const Pipeline*>(pipeline)->GetId() : 0);
++}
++void Gfx::SetFramebuffer(AbstractFramebuffer* framebuffer)
++{
++  if (m_current_framebuffer == framebuffer)
++    return;
++  AbstractGfx::SetFramebuffer(framebuffer);
++  wgpu_set_framebuffer(static_cast<Framebuffer*>(framebuffer)->GetId(), 0, 0, 0, 0, 0, 0);
++}
++void Gfx::SetAndDiscardFramebuffer(AbstractFramebuffer* framebuffer)
++{
++  AbstractGfx::SetFramebuffer(framebuffer);
++  wgpu_set_framebuffer(static_cast<Framebuffer*>(framebuffer)->GetId(), 1, 0, 0, 0, 0, 0);
++}
++void Gfx::SetAndClearFramebuffer(AbstractFramebuffer* framebuffer, const ClearColor& c, float z)
++{
++  AbstractGfx::SetFramebuffer(framebuffer);
++  wgpu_set_framebuffer(static_cast<Framebuffer*>(framebuffer)->GetId(), 2, c[0], c[1], c[2], c[3],
++                       z);
++}
++void Gfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool color_enable,
++                      bool alpha_enable, bool z_enable, u32 color, u32 z)
++{
++  // Whole-target clears become a cleared render pass (like Metal); anything
++  // partial draws a quad through the shared utility path.
++  const int fw = m_current_framebuffer->GetWidth(), fh = m_current_framebuffer->GetHeight();
++  if (target_rc == MathUtil::Rectangle<int>(0, 0, fw, fh))
++  {
++    if (bpmem.zcontrol.pixel_format == PixelFormat::RGB565_Z16 ||
++        bpmem.zcontrol.pixel_format == PixelFormat::RGB8_Z24 ||
++        bpmem.zcontrol.pixel_format == PixelFormat::Z24)
++    {
++      alpha_enable = true;
++      color &= 0x00FFFFFF;
++    }
++    const bool c_ok = (color_enable && alpha_enable) || !m_current_framebuffer->HasColorBuffer();
++    const bool z_ok = z_enable || !m_current_framebuffer->HasDepthBuffer();
++    if (c_ok && z_ok)
++    {
++      float zn = static_cast<float>(z & 0xFFFFFF) / 16777216.0f;
++      if (!g_backend_info.bSupportsReversedDepthRange)
++        zn = 1.0f - zn;
++      wgpu_set_framebuffer(static_cast<Framebuffer*>(m_current_framebuffer)->GetId(), 2,
++                           ((color >> 16) & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f,
++                           (color & 0xFF) / 255.0f, ((color >> 24) & 0xFF) / 255.0f, zn);
++      return;
++    }
++  }
++  AbstractGfx::ClearRegion(target_rc, color_enable, alpha_enable, z_enable, color, z);
++}
++void Gfx::SetScissorRect(const MathUtil::Rectangle<int>& rc)
++{
++  wgpu_set_scissor(rc.left, rc.top, rc.GetWidth(), rc.GetHeight());
++}
++void Gfx::SetTexture(u32 index, const AbstractTexture* texture)
++{
++  if (index < 16)
++    m_bound_textures[index] = static_cast<const Texture*>(texture);
++  wgpu_set_texture(index, TexId(texture));
++}
++void Gfx::SetSamplerState(u32 index, const SamplerState& state)
++{
++  wgpu_set_sampler(index, state.tm0.hex, state.tm1.hex);
++}
++void Gfx::UnbindTexture(const AbstractTexture* texture)
++{
++  for (u32 i = 0; i < 16; i++)
++  {
++    if (m_bound_textures[i] == texture)
++    {
++      m_bound_textures[i] = nullptr;
++      wgpu_set_texture(i, 0);
++    }
++  }
++}
++void Gfx::SetViewport(float x, float y, float width, float height, float near_depth,
++                      float far_depth)
++{
++  wgpu_set_viewport(x, y, width, height, near_depth, far_depth);
++}
++void Gfx::Draw(u32 base_vertex, u32 num_vertices)
++{
++  wgpu_draw(base_vertex, num_vertices);
++}
++void Gfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
++{
++  wgpu_draw_indexed(base_index, num_indices, base_vertex);
++}
++
++void Gfx::EnsureBackbuffer()
++{
++  const int w = std::max(1, g_surface_width), h = std::max(1, g_surface_height);
++  if (m_backbuffer && static_cast<int>(m_backbuffer->GetWidth()) == w &&
++      static_cast<int>(m_backbuffer->GetHeight()) == h)
++    return;
++  m_backbuffer_fb.reset();
++  m_backbuffer.reset();
++  TextureConfig cfg(w, h, 1, 1, 1, AbstractTextureFormat::RGBA8, AbstractTextureFlag_RenderTarget,
++                    AbstractTextureType::Texture_2DArray);
++  m_backbuffer.reset(static_cast<Texture*>(CreateTexture(cfg, "backbuffer").release()));
++  m_backbuffer_fb.reset(
++      static_cast<Framebuffer*>(CreateFramebuffer(m_backbuffer.get(), nullptr, {}).release()));
++}
++bool Gfx::BindBackbuffer(const ClearColor& clear_color)
++{
++  EnsureBackbuffer();
++  SetAndClearFramebuffer(m_backbuffer_fb.get(), clear_color, 1.0f);
++  return true;
++}
++void Gfx::PresentBackbuffer()
++{
++  wgpu_present(m_backbuffer ? m_backbuffer->GetId() : 0,
++               g_get_frontend_framebuffer ? g_get_frontend_framebuffer() : 0);
++  if (g_frontend_present && m_backbuffer)
++    g_frontend_present(m_backbuffer->GetWidth(), m_backbuffer->GetHeight());
++}
++void Gfx::Flush()
++{
++  wgpu_flush();
++}
++void Gfx::WaitForGPUIdle()
++{
++  wgpu_flush();
++}
++SurfaceInfo Gfx::GetSurfaceInfo() const
++{
++  return {static_cast<u32>(std::max(1, g_surface_width)),
++          static_cast<u32>(std::max(1, g_surface_height)), 1.0f, AbstractTextureFormat::RGBA8};
++}
++
++// ---------------------------------------------------------------------------
++// Vertex manager
++// ---------------------------------------------------------------------------
++void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_indices,
++                                 u32* out_base_vertex, u32* out_base_index)
++{
++  *out_base_vertex = num_vertices ?
++                         wgpu_vertices(m_cpu_vertex_buffer.data(), num_vertices * vertex_stride,
++                                       vertex_stride) :
++                         0;
++  *out_base_index = num_indices ? wgpu_indices(m_cpu_index_buffer.data(), num_indices) : 0;
++}
++void VertexManager::UploadUniforms()
++{
++  auto& system = Core::System::GetInstance();
++  auto& vsm = system.GetVertexShaderManager();
++  auto& gsm = system.GetGeometryShaderManager();
++  auto& psm = system.GetPixelShaderManager();
++  if (psm.dirty)
++  {
++    wgpu_uniforms(0, &psm.constants, sizeof(psm.constants));
++    psm.dirty = false;
++  }
++  if (vsm.dirty)
++  {
++    wgpu_uniforms(1, &vsm.constants, sizeof(vsm.constants));
++    vsm.dirty = false;
++  }
++  if (gsm.dirty)
++  {
++    wgpu_uniforms(2, &gsm.constants, sizeof(gsm.constants));
++    gsm.dirty = false;
++  }
++}
++void VertexManager::UploadUtilityUniforms(const void* uniforms, u32 uniforms_size)
++{
++  InvalidateConstants();
++  wgpu_uniforms(3, uniforms, uniforms_size);
++}
++
++// ---------------------------------------------------------------------------
++// Backend
++// ---------------------------------------------------------------------------
++void VideoBackend::InitBackendInfo(const WindowSystemInfo&)
++{
++  auto& b = g_backend_info;
++  b.api_type = APIType::Metal;  // same GLSL conventions as the Metal backend
++  b.MaxTextureSize = 8192;
++  b.bUsesLowerLeftOrigin = false;
++  b.bSupportsExclusiveFullscreen = false;
++  b.bSupportsDualSourceBlend = IsReady() && wgpu_feature(0);
++  b.bSupportsPrimitiveRestart = false;
++  b.bSupportsGeometryShaders = false;
++  b.bSupportsComputeShaders = false;
++  b.bSupports3DVision = false;
++  b.bSupportsEarlyZ = true;
++  b.bSupportsBindingLayout = true;
++  b.bSupportsBBox = false;
++  b.bSupportsGSInstancing = false;
++  b.bSupportsPostProcessing = true;
++  b.bSupportsPaletteConversion = false;
++  b.bSupportsClipControl = true;
++  b.bSupportsSSAA = false;
++  b.bSupportsFragmentStoresAndAtomics = false;
++  b.bSupportsReversedDepthRange = false;
++  b.bSupportsLogicOp = false;
++  b.bSupportsMultithreading = false;
++  b.bSupportsGPUTextureDecoding = false;
++  b.bSupportsCopyToVram = true;
++  b.bSupportsBitfield = true;
++  b.bSupportsDynamicSamplerIndexing = false;
++  b.bSupportsFramebufferFetch = false;
++  b.bSupportsBackgroundCompiling = false;
++  b.bSupportsLargePoints = false;
++  b.bSupportsPartialDepthCopies = true;
++  b.bSupportsDepthReadback = true;
++  b.bSupportsShaderBinaries = false;
++  b.bSupportsPipelineCacheData = false;
++  b.bSupportsCoarseDerivatives = false;
++  b.bSupportsTextureQueryLevels = true;
++  b.bSupportsLodBiasInSampler = false;
++  b.bSupportsSettingObjectNames = false;
++  b.bSupportsPartialMultisampleResolve = false;
++  b.bSupportsDynamicVertexLoader = false;
++  b.bSupportsVSLinePointExpand = false;
++  b.bSupportsDepthClamp = false;
++  b.bSupportsST3CTextures = IsReady() && wgpu_feature(2);
++  b.bSupportsBPTCTextures = b.bSupportsST3CTextures;
++  b.bSupportsHDROutput = false;
++  b.Adapters.clear();
++  b.AAModes = {1};
++}
++
++bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
++{
++  Kick();
++  if (!IsReady())
++  {
++    PanicAlertFmt("WebGPU is not available (device not ready). Reload with WebGPU off.");
++    return false;
++  }
++  InitBackendInfo(wsi);
++  UpdateActiveConfig();
++  return InitializeShared(std::make_unique<Gfx>(), std::make_unique<VertexManager>(),
++                          std::make_unique<Null::PerfQuery>(),
++                          std::make_unique<Null::NullBoundingBox>());
++}
++void VideoBackend::Shutdown()
++{
++  ShutdownShared();
++  wgpu_flush();
++}
++}  // namespace WGPU
+diff --git a/Source/Core/VideoBackends/WebGPU/WGPUBackend.h b/Source/Core/VideoBackends/WebGPU/WGPUBackend.h
+new file mode 100644
+index 0000000..e06e750
+--- /dev/null
++++ b/Source/Core/VideoBackends/WebGPU/WGPUBackend.h
+@@ -0,0 +1,201 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// WebGPU video backend for the browser (Emscripten) build. Rendering state lives
++// in JavaScript (WGPURuntime.js); these classes hold integer handles into it.
++
++#pragma once
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "VideoCommon/AbstractFramebuffer.h"
++#include "VideoCommon/AbstractGfx.h"
++#include "VideoCommon/AbstractPipeline.h"
++#include "VideoCommon/AbstractShader.h"
++#include "VideoCommon/AbstractStagingTexture.h"
++#include "VideoCommon/AbstractTexture.h"
++#include "VideoCommon/NativeVertexFormat.h"
++#include "VideoCommon/VertexManagerBase.h"
++#include "VideoCommon/VideoBackendBase.h"
++
++namespace WGPU
++{
++// Set by the libretro frontend: size of the picture handed to RetroArch, and a
++// callback that returns RetroArch's current framebuffer and presents the frame.
++extern int g_surface_width;
++extern int g_surface_height;
++extern unsigned (*g_get_frontend_framebuffer)();
++extern void (*g_frontend_present)(int width, int height);
++
++// Starts creating the WebGPU device (asynchronous) as early as possible.
++void Kick();
++bool IsReady();
++
++class Texture final : public AbstractTexture
++{
++public:
++  Texture(const TextureConfig& config, int id) : AbstractTexture(config), m_id(id) {}
++  ~Texture() override;
++  void CopyRectangleFromTexture(const AbstractTexture* src, const MathUtil::Rectangle<int>& src_rect,
++                                u32 src_layer, u32 src_level,
++                                const MathUtil::Rectangle<int>& dst_rect, u32 dst_layer,
++                                u32 dst_level) override;
++  void ResolveFromTexture(const AbstractTexture* src, const MathUtil::Rectangle<int>& rect,
++                          u32 layer, u32 level) override;
++  void Load(u32 level, u32 width, u32 height, u32 row_length, const u8* buffer, size_t buffer_size,
++            u32 layer) override;
++  int GetId() const { return m_id; }
++
++private:
++  int m_id;
++};
++
++class StagingTexture final : public AbstractStagingTexture
++{
++public:
++  StagingTexture(StagingTextureType type, const TextureConfig& config);
++  ~StagingTexture() override;
++  void CopyFromTexture(const AbstractTexture* src, const MathUtil::Rectangle<int>& src_rect,
++                       u32 src_layer, u32 src_level,
++                       const MathUtil::Rectangle<int>& dst_rect) override;
++  void CopyToTexture(const MathUtil::Rectangle<int>& src_rect, AbstractTexture* dst,
++                     const MathUtil::Rectangle<int>& dst_rect, u32 dst_layer,
++                     u32 dst_level) override;
++  bool Map() override;
++  void Unmap() override;
++  void Flush() override;
++
++private:
++  std::vector<u8> m_data;
++  int m_id;
++};
++
++class Framebuffer final : public AbstractFramebuffer
++{
++public:
++  Framebuffer(AbstractTexture* color, AbstractTexture* depth,
++              std::vector<AbstractTexture*> additional, AbstractTextureFormat color_format,
++              AbstractTextureFormat depth_format, u32 width, u32 height, int id)
++      : AbstractFramebuffer(color, depth, std::move(additional), color_format, depth_format,
++                            width, height, 1, 1),
++        m_id(id)
++  {
++  }
++  ~Framebuffer() override;
++  int GetId() const { return m_id; }
++
++private:
++  int m_id;
++};
++
++class Shader final : public AbstractShader
++{
++public:
++  Shader(ShaderStage stage, int id) : AbstractShader(stage), m_id(id) {}
++  ~Shader() override;
++  int GetId() const { return m_id; }
++
++private:
++  int m_id;
++};
++
++class Pipeline final : public AbstractPipeline
++{
++public:
++  Pipeline(const AbstractPipelineConfig& config, int id) : AbstractPipeline(config), m_id(id) {}
++  ~Pipeline() override;
++  int GetId() const { return m_id; }
++
++private:
++  int m_id;
++};
++
++class VertexFormat final : public NativeVertexFormat
++{
++public:
++  explicit VertexFormat(const PortableVertexDeclaration& decl);
++  int GetId() const { return m_id; }
++
++private:
++  int m_id;
++};
++
++class Gfx final : public AbstractGfx
++{
++public:
++  Gfx();
++  ~Gfx() override;
++
++  bool IsHeadless() const override { return false; }
++  std::unique_ptr<AbstractTexture> CreateTexture(const TextureConfig& config,
++                                                 std::string_view name) override;
++  std::unique_ptr<AbstractStagingTexture>
++  CreateStagingTexture(StagingTextureType type, const TextureConfig& config) override;
++  std::unique_ptr<AbstractFramebuffer>
++  CreateFramebuffer(AbstractTexture* color_attachment, AbstractTexture* depth_attachment,
++                    std::vector<AbstractTexture*> additional_color_attachments) override;
++  std::unique_ptr<AbstractShader> CreateShaderFromSource(ShaderStage stage,
++                                                         std::string_view source,
++                                                         VideoCommon::ShaderIncluder* includer,
++                                                         std::string_view name) override;
++  std::unique_ptr<AbstractShader> CreateShaderFromBinary(ShaderStage stage, const void* data,
++                                                         size_t length,
++                                                         std::string_view name) override;
++  std::unique_ptr<NativeVertexFormat>
++  CreateNativeVertexFormat(const PortableVertexDeclaration& vtx_decl) override;
++  std::unique_ptr<AbstractPipeline> CreatePipeline(const AbstractPipelineConfig& config,
++                                                   const void* cache_data = nullptr,
++                                                   size_t cache_data_length = 0) override;
++
++  void SetPipeline(const AbstractPipeline* pipeline) override;
++  void SetFramebuffer(AbstractFramebuffer* framebuffer) override;
++  void SetAndDiscardFramebuffer(AbstractFramebuffer* framebuffer) override;
++  void SetAndClearFramebuffer(AbstractFramebuffer* framebuffer, const ClearColor& color_value,
++                              float depth_value) override;
++  void ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool color_enable,
++                   bool alpha_enable, bool z_enable, u32 color, u32 z) override;
++  void SetScissorRect(const MathUtil::Rectangle<int>& rc) override;
++  void SetTexture(u32 index, const AbstractTexture* texture) override;
++  void SetSamplerState(u32 index, const SamplerState& state) override;
++  void UnbindTexture(const AbstractTexture* texture) override;
++  void SetViewport(float x, float y, float width, float height, float near_depth,
++                   float far_depth) override;
++  void Draw(u32 base_vertex, u32 num_vertices) override;
++  void DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex) override;
++  bool BindBackbuffer(const ClearColor& clear_color = {}) override;
++  void PresentBackbuffer() override;
++  void Flush() override;
++  void WaitForGPUIdle() override;
++  SurfaceInfo GetSurfaceInfo() const override;
++
++private:
++  void EnsureBackbuffer();
++  std::unique_ptr<Texture> m_backbuffer;
++  std::unique_ptr<Framebuffer> m_backbuffer_fb;
++  const Texture* m_bound_textures[16] = {};
++};
++
++class VertexManager final : public VertexManagerBase
++{
++public:
++  void UploadUtilityUniforms(const void* uniforms, u32 uniforms_size) override;
++
++protected:
++  void CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_indices, u32* out_base_vertex,
++                    u32* out_base_index) override;
++  void UploadUniforms() override;
++};
++
++class VideoBackend final : public VideoBackendBase
++{
++public:
++  bool Initialize(const WindowSystemInfo& wsi) override;
++  void Shutdown() override;
++  std::string GetConfigName() const override { return CONFIG_NAME; }
++  std::string GetDisplayName() const override { return "WebGPU"; }
++  void InitBackendInfo(const WindowSystemInfo& wsi) override;
++  static constexpr const char* CONFIG_NAME = "WebGPU";
++};
++}  // namespace WGPU
+diff --git a/Source/Core/VideoBackends/WebGPU/WGPURuntime.js b/Source/Core/VideoBackends/WebGPU/WGPURuntime.js
+new file mode 100644
+index 0000000..07370f3
+--- /dev/null
++++ b/Source/Core/VideoBackends/WebGPU/WGPURuntime.js
+@@ -0,0 +1,668 @@
++// WebGPU backend runtime for Dolphin (browser side). Evaluated once with `env`:
++//   env.heap()  -> current HEAPU8      env.gl() -> current WebGL context (RetroArch's)
++//   env.GL      -> Emscripten GL object tables    env.str(ptr) -> UTF8ToString
++//   env.nagaGlue / env.nagaB64 -> naga (GLSL -> WGSL translator) glue + wasm
++// The C++ side (WGPUBackend.cpp) talks to the returned object `W` through small
++// EM_JS stubs; objects are referred to by integer ids.
++'use strict';
++var W = {};
++var dev = null, queue = null, state = 0, feats = {}, nerr = 0;
++var O = [null];
++function put(o) { O.push(o); return O.length - 1; }
++function H() { return env.heap(); }
++function log() { console.log.apply(console, ['[wgpu]'].concat([].slice.call(arguments))); }
++function err() { if (nerr++ < 200) console.error.apply(console, ['[wgpu]'].concat([].slice.call(arguments))); }
++function align(v, a) { return Math.ceil(v / a) * a; }
++
++// ---------------- naga ----------------
++var naga = null;
++function initNaga() {
++  if (naga) return;
++  var glue = (new Function(env.nagaGlue + '\nreturn {initSync: initSync, parseGlsl: parseGlsl, validate: validate, writeWgsl: writeWgsl};'))();
++  var s = atob(env.nagaB64), b = new Uint8Array(s.length);
++  for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
++  glue.initSync({ module: b });
++  naga = glue;
++}
++
++// ---------------- device ----------------
++var WANT = ['dual-source-blending', 'float32-filterable', 'texture-compression-bc', 'depth32float-stencil8'];
++W.kick = function() {
++  if (W._kicked) return;
++  W._kicked = true;
++  try { initNaga(); } catch (e) { state = -1; err('naga init failed', e); return; }
++  if (!navigator.gpu) { state = -1; err('navigator.gpu missing'); return; }
++  navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).then(function(a) {
++    if (!a) throw new Error('no WebGPU adapter');
++    var want = WANT.filter(function(f) { return a.features.has(f); });
++    want.forEach(function(f) { feats[f] = true; });
++    return a.requestDevice({ requiredFeatures: want,
++      requiredLimits: { maxUniformBufferBindingSize: Math.min(65536, a.limits.maxUniformBufferBindingSize) } });
++  }).then(function(d) {
++    dev = d; queue = d.queue;
++    d.lost.then(function(i) { err('device lost:', i.message); });
++    d.onuncapturederror = function(e) { err(e.error.message); };
++    setup();
++    state = 1;
++    log('device ready; features:', Object.keys(feats).join(','));
++  }).catch(function(e) { state = -1; err('init failed', e); });
++};
++W.state = function() { return state; };
++W.feature = function(i) { return feats[['dual-source-blending', 'float32-filterable', 'texture-compression-bc'][i]] ? 1 : 0; };
++
++// ---------------- formats (AbstractTextureFormat order) ----------------
++var FMT = [
++  { name: 'rgba8unorm', bytes: 4 }, { name: 'bgra8unorm', bytes: 4 }, { name: 'rgb10a2unorm', bytes: 4 },
++  { name: 'rgba16float', bytes: 8 }, { name: 'bc1-rgba-unorm', bytes: 8, block: 4 },
++  { name: 'bc2-rgba-unorm', bytes: 16, block: 4 }, { name: 'bc3-rgba-unorm', bytes: 16, block: 4 },
++  { name: 'bc7-rgba-unorm', bytes: 16, block: 4 }, { name: 'r16float', bytes: 2 },
++  { name: 'depth16unorm', bytes: 2, depth: true }, { name: 'depth24plus-stencil8', bytes: 4, depth: true, stencil: true },
++  { name: 'r32float', bytes: 4 }, { name: 'depth32float', bytes: 4, depth: true },
++  { name: 'depth32float-stencil8', bytes: 4, depth: true, stencil: true }, null];
++
++// ---------------- frame state ----------------
++var encoder = null, pass = null, trash = [], curFb = 0, pendingClear = null;
++var curPipe = 0, vp = [0, 0, 1, 1, 0, 1], sc = [0, 0, 1, 1];
++var dPipe = true, dVP = true, dSC = true, dVB = true, dBG0 = true, dBG1 = true;
++var slots = [], samplers = [], samplerCache = new Map();
++var vbuf, ibuf, ubuf, bgl0, bg0, dummy, VSIZE = 32 << 20, ISIZE = 8 << 20, USIZE = 8 << 20, UBIND = 16384;
++var vpos = 0, ipos = 0, upos = 0, gxOff = [0, 0, 0], utilOff = 0;
++var stats = W.stats = { draws: 0, passes: 0, submits: 0, pipelines: 0, shaders: 0, shaderFails: 0, uploads: 0 };
++
++function setup() {
++  var U = GPUBufferUsage;
++  vbuf = dev.createBuffer({ size: VSIZE, usage: U.VERTEX | U.COPY_DST });
++  ibuf = dev.createBuffer({ size: ISIZE, usage: U.INDEX | U.COPY_DST });
++  ubuf = dev.createBuffer({ size: USIZE, usage: U.UNIFORM | U.COPY_DST });
++  var vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
++  var e = [];
++  for (var i = 0; i < 3; i++) e.push({ binding: i, visibility: vis, buffer: { type: 'uniform', hasDynamicOffset: true } });
++  bgl0 = dev.createBindGroupLayout({ entries: e });
++  bg0 = dev.createBindGroup({ layout: bgl0, entries: [0, 1, 2].map(function(i) { return { binding: i, resource: { buffer: ubuf, offset: 0, size: UBIND } }; }) });
++  var t = dev.createTexture({ size: [1, 1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
++  queue.writeTexture({ texture: t }, new Uint8Array([0, 0, 0, 255]), { bytesPerRow: 4 }, [1, 1, 1]);
++  dummy = { t: t, w: 1, h: 1, layers: 1, levels: 1, f: FMT[0], views: {} };
++}
++
++function enc() { if (!encoder) encoder = dev.createCommandEncoder(); return encoder; }
++function endPass() { if (pass) { pass.end(); pass = null; } }
++function submit() {
++  endPass();
++  if (encoder) { queue.submit([encoder.finish()]); encoder = null; stats.submits++; }
++  for (var i = 0; i < trash.length; i++) trash[i].destroy();
++  trash = [];
++}
++W.flush = submit;
++function dirtyAll() { dPipe = dVP = dSC = dVB = dBG0 = dBG1 = true; }
++
++function view(o, kind) {
++  var v = o.views[kind];
++  if (v) return v;
++  if (kind === 'rt') v = o.t.createView({ dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 1 });
++  else if (kind === '2d') v = o.t.createView({ dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1 });
++  else v = o.t.createView({ dimension: '2d-array' });
++  return (o.views[kind] = v);
++}
++
++// ---------------- textures ----------------
++var bgCacheEpoch = 0;
++W.texCreate = function(w, h, layers, levels, fmt, rt) {
++  var f = FMT[fmt];
++  if (!f) { err('bad texture format', fmt); return 0; }
++  var U = GPUTextureUsage, usage = U.TEXTURE_BINDING | U.COPY_DST | U.COPY_SRC;
++  if (rt && !f.block) usage |= U.RENDER_ATTACHMENT;
++  var t = dev.createTexture({ size: [w, h, layers], mipLevelCount: levels, format: f.name, usage: usage });
++  return put({ t: t, w: w, h: h, layers: layers, levels: levels, fmt: fmt, f: f, views: {}, shadow: null, shadowDirty: true });
++};
++W.texDestroy = function(id) {
++  var o = O[id];
++  if (!o) return;
++  trash.push(o.t);
++  if (o.shadow) trash.push(o.shadow.t);
++  O[id] = null;
++  for (var i = 0; i < slots.length; i++) if (slots[i] === o) slots[i] = null;
++  bgCacheEpoch++;
++};
++function uploadBytes(o, level, layer, x, y, w, h, src, srcRowBytes, rows) {
++  var bpr = align(srcRowBytes, 256);
++  var buf = dev.createBuffer({ size: Math.max(4, bpr * rows), usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
++  var m = new Uint8Array(buf.getMappedRange());
++  for (var r = 0; r < rows; r++) {
++    var s0 = r * srcRowBytes;
++    if (s0 >= src.length) break;
++    m.set(src.subarray(s0, Math.min(src.length, s0 + srcRowBytes)), r * bpr);
++  }
++  buf.unmap();
++  endPass();
++  enc().copyBufferToTexture({ buffer: buf, bytesPerRow: bpr, rowsPerImage: rows },
++                            { texture: o.t, mipLevel: level, origin: [x, y, layer] }, [w, h, 1]);
++  trash.push(buf);
++  stats.uploads++;
++}
++// rowLength: texels per source row
++W.texUpload = function(id, level, layer, x, y, w, h, rowLength, ptr, size) {
++  var o = O[id];
++  if (!o) return;
++  var f = o.f, rowBytes, rows;
++  if (f.block) { rowBytes = Math.ceil(rowLength / 4) * f.bytes; rows = Math.ceil(h / 4); }
++  else { rowBytes = rowLength * f.bytes; rows = h; }
++  var mw = Math.max(1, o.w >> level), mh = Math.max(1, o.h >> level);
++  if (f.block) { w = Math.min(align(w, 4), align(mw, 4)); h = Math.min(align(h, 4), align(mh, 4)); }
++  uploadBytes(o, level, layer, x, y, w, h, H().subarray(ptr, ptr + size), rowBytes, rows);
++  if (f.depth) o.shadowDirty = true;
++};
++W.texCopy = function(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h) {
++  var a = O[src], b = O[dst];
++  if (!a || !b) return;
++  endPass();
++  enc().copyTextureToTexture({ texture: a.t, mipLevel: slev, origin: [sx, sy, sl] },
++                             { texture: b.t, mipLevel: dlev, origin: [dx, dy, dl] }, [w, h, 1]);
++  if (b.f.depth) b.shadowDirty = true;
++};
++// Depth textures can't be sampled as float with filtering: keep an r32float copy.
++function shadowOf(o) {
++  if (!o.f.depth) return o;
++  if (o.fmt !== 12 && o.fmt !== 13) return dummy;
++  if (!o.shadow) {
++    o.shadow = { t: dev.createTexture({ size: [o.w, o.h, 1], format: 'r32float',
++      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST }), w: o.w, h: o.h, f: FMT[11], views: {} };
++    o.shadowDirty = true;
++  }
++  if (o.shadowDirty) {
++    endPass();
++    var bpr = align(o.w * 4, 256);
++    var buf = dev.createBuffer({ size: bpr * o.h, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
++    enc().copyTextureToBuffer({ texture: o.t, aspect: 'depth-only' }, { buffer: buf, bytesPerRow: bpr }, [o.w, o.h, 1]);
++    enc().copyBufferToTexture({ buffer: buf, bytesPerRow: bpr }, { texture: o.shadow.t }, [o.w, o.h, 1]);
++    trash.push(buf);
++    o.shadowDirty = false;
++  }
++  return o.shadow;
++}
++W.setTexture = function(slot, id) {
++  var o = id ? O[id] : null;
++  if (o && o.f.depth && o.shadowDirty) shadowOf(o);
++  if (slots[slot] !== o) { slots[slot] = o; dBG1 = true; }
++};
++var ADDR = ['clamp-to-edge', 'repeat', 'mirror-repeat', 'clamp-to-edge'];
++W.setSampler = function(slot, tm0, tm1) {
++  var key = tm0 + ',' + tm1, s = samplerCache.get(key);
++  if (!s) {
++    var lin = function(b) { return (tm0 >> b) & 1 ? 'linear' : 'nearest'; };
++    var aniso = (tm0 >>> 25) & 15, minL = (tm1 & 255) / 16, maxL = ((tm1 >> 8) & 255) / 16;
++    var d = { minFilter: lin(0), magFilter: lin(1), mipmapFilter: lin(2), addressModeU: ADDR[(tm0 >> 3) & 3],
++              addressModeV: ADDR[(tm0 >> 5) & 3], lodMinClamp: minL, lodMaxClamp: Math.max(minL, maxL) };
++    if (aniso && d.minFilter === 'linear' && d.magFilter === 'linear' && d.mipmapFilter === 'linear')
++      d.maxAnisotropy = Math.min(16, 1 << aniso);
++    s = dev.createSampler(d);
++    samplerCache.set(key, s);
++  }
++  if (samplers[slot] !== s) { samplers[slot] = s; dBG1 = true; }
++};
++
++// ---------------- framebuffers ----------------
++W.fbCreate = function(color, depth, addPtr, addCount) {
++  var adds = [], h32 = new Int32Array(H().buffer);
++  for (var i = 0; i < addCount; i++) adds.push(O[h32[(addPtr >> 2) + i]]);
++  var c = color ? O[color] : null, d = depth ? O[depth] : null, r = c || d;
++  return put({ color: c, depth: d, adds: adds, w: r ? r.w : 1, h: r ? r.h : 1 });
++};
++W.fbDestroy = function(id) { if (curFb === id) { endPass(); curFb = 0; } O[id] = null; };
++// mode 0: load, 1: discard (contents undefined), 2: clear to the given values
++W.setFramebuffer = function(id, mode, r, g, b, a, z) {
++  endPass();
++  curFb = id;
++  pendingClear = mode ? { c: mode === 2 ? [r, g, b, a] : [0, 0, 0, 0], d: mode === 2 ? z : 1 } : null;
++};
++function beginPass() {
++  if (pass) return true;
++  var fb = O[curFb];
++  if (!fb) return false;
++  var pc = pendingClear;
++  pendingClear = null;
++  var att = function(o) { return { view: view(o, 'rt'), loadOp: pc ? 'clear' : 'load', clearValue: pc ? pc.c : [0, 0, 0, 0], storeOp: 'store' }; };
++  var desc = { colorAttachments: [] };
++  if (fb.color) desc.colorAttachments.push(att(fb.color));
++  fb.adds.forEach(function(o) { desc.colorAttachments.push(att(o)); });
++  if (fb.depth) {
++    var dd = { view: view(fb.depth, 'rt'), depthLoadOp: pc ? 'clear' : 'load', depthClearValue: pc ? pc.d : 1, depthStoreOp: 'store' };
++    if (fb.depth.f.stencil) { dd.stencilLoadOp = pc ? 'clear' : 'load'; dd.stencilClearValue = 0; dd.stencilStoreOp = 'store'; }
++    desc.depthStencilAttachment = dd;
++    fb.depth.shadowDirty = true;
++  }
++  pass = enc().beginRenderPass(desc);
++  stats.passes++;
++  dirtyAll();
++  return true;
++}
++W.setViewport = function(x, y, w, h, n, f) { vp = [x, y, w, h, n, f]; dVP = true; };
++W.setScissor = function(x, y, w, h) { sc = [x, y, w, h]; dSC = true; };
++
++// ---------------- shaders (GLSL -> WGSL) ----------------
++var TEXFN = /\b(texture|textureLod|textureGrad|textureOffset|textureLodOffset|textureProj|textureProjLod|texelFetch|texelFetchOffset|textureSize|textureQueryLevels|textureQueryLod|textureGather|textureGatherOffset|textureSamples)\s*\(\s*@@(\w+)@@/g;
++function texType(st) { return st.replace('sampler', 'texture'); }
++// WGSL has no combined image-samplers: split every `samplerXX` into a texture
++// (binding 2n) and a sampler (binding 2n+1). Array elements must be indexed by
++// constants (dynamic sampler indexing is disabled for this backend).
++function splitSamplers(src) {
++  var ph = {};
++  src = src.replace(/layout\s*\(([^)]*)\)\s*uniform\s+([iu]?sampler\w+)\s+(\w+)\s*(\[\s*(\d+)\s*\])?\s*;/g,
++    function(m, lay, type, name, arr, n) {
++      var set = /set\s*=\s*(\d+)/.exec(lay), bind = /binding\s*=\s*(\d+)/.exec(lay);
++      set = set ? +set[1] : 1; bind = bind ? +bind[1] : 0;
++      var out = '', cnt = arr ? +n : 1;
++      for (var i = 0; i < cnt; i++) {
++        var t = name + '_T' + (arr ? i : ''), s = name + '_S' + (arr ? i : ''), b = bind + i;
++        out += 'layout(set = ' + set + ', binding = ' + (2 * b) + ') uniform ' + texType(type) + ' ' + t + ';\n';
++        out += 'layout(set = ' + set + ', binding = ' + (2 * b + 1) + ') uniform sampler ' + s + ';\n';
++        ph[arr ? name + '_' + i : name] = { t: t, s: s, type: type };
++      }
++      ph['$arr_' + name] = arr ? 1 : 0;
++      return out;
++    });
++  Object.keys(ph).forEach(function(k) {
++    if (k.indexOf('$arr_') !== 0) return;
++    var name = k.substr(5);
++    if (ph[k]) {
++      src = src.replace(new RegExp('\\b' + name + '\\s*\\[\\s*(\\d+)u?\\s*\\]', 'g'), function(m, i) { return '@@' + name + '_' + i + '@@'; });
++    } else {
++      src = src.replace(new RegExp('(^|[^.\\w])' + name + '\\b(?!_[TS])', 'g'), function(m, p) { return p + '@@' + name + '@@'; });
++    }
++  });
++  // function parameters of sampler type
++  src = src.replace(/\b(in\s+)?([iu]?sampler(?:2D|2DArray|3D|Cube)\w*)\s+(\w+)\s*(?=[,)])/g, function(m, inq, type, name) {
++    ph[name] = { t: name + '_T', s: name + '_S', type: type };
++    return texType(type) + ' ' + name + '_T, sampler ' + name + '_S';
++  });
++  Object.keys(ph).forEach(function(k) {
++    var p = ph[k];
++    if (k.indexOf('$') === 0 || p.t !== k + '_T' || !/^[a-z]/i.test(k)) return;
++    if (src.indexOf('@@' + k + '@@') >= 0) return;
++    src = src.replace(new RegExp('(^|[^.\\w@])' + k + '\\b(?!_[TS])', 'g'), function(m, pre) { return pre + '@@' + k + '@@'; });
++    // undo inside the parameter list we just wrote
++    src = src.split(texType(p.type) + ' @@' + k + '@@_T').join(texType(p.type) + ' ' + k + '_T');
++  });
++  src = src.replace(TEXFN, function(m, fn, k) {
++    var p = ph[k];
++    return p ? fn + '(' + p.type + '(' + p.t + ', ' + p.s + ')' : m;
++  });
++  src = src.replace(/@@(\w+)@@/g, function(m, k) { var p = ph[k]; return p ? p.t + ', ' + p.s : m; });
++  return src;
++}
++// WGSL uniform buffers can't hold bool: store uint and compare at each use.
++function fixUniformBools(src) {
++  var names = [];
++  src = src.replace(/uniform\s+\w+\s*\{[^}]*\}/g, function(block) {
++    return block.replace(/\bbool\s+(\w+)\s*;/g, function(m, n) { names.push(n); return 'uint ' + n + '_u;'; });
++  });
++  names.forEach(function(n) { src = src.replace(new RegExp('([^.\\w])' + n + '\\b(?!_u)', 'g'), '$1(' + n + '_u != 0u)'); });
++  return src;
++}
++// Replace fn(args) with f(args) where args may contain nested parentheses.
++function replaceCalls(src, fn, f) {
++  var re = new RegExp('\\b' + fn + '\\s*\\(', 'g'), out = '', last = 0, m;
++  while ((m = re.exec(src))) {
++    var i = re.lastIndex, depth = 1;
++    while (i < src.length && depth) { var c = src[i++]; if (c === '(') depth++; else if (c === ')') depth--; }
++    out += src.slice(last, m.index) + f(src.slice(re.lastIndex, i - 1));
++    last = i; re.lastIndex = i;
++  }
++  return out + src.slice(last);
++}
++function toWgsl(glsl, stage) {
++  var src = glsl.replace(/^\s*#\s*(line|extension|pragma)\b.*$/gm, '').replace(/^\s*#\s*version.*$/m, '#version 450');
++  if (src.indexOf('#version') < 0) src = '#version 450\n' + src;
++  src = splitSamplers(src);
++  src = fixUniformBools(src);
++  // a lone index-0 output (dual-source declared but unused) isn't valid WGSL
++  if (!/index\s*=\s*1\b/.test(src)) src = src.replace(/,\s*index\s*=\s*0\b/g, '');
++  src = replaceCalls(src, 'isnan', function(a) { return '((' + a + ') != (' + a + '))'; });
++  var m = null, info = null;
++  try {
++    m = naga.parseGlsl(src, { stage: stage });
++    info = naga.validate(m);
++    return 'diagnostic(off, derivative_uniformity);\n' + naga.writeWgsl(m, info);
++  } catch (e) {
++    stats.shaderFails++;
++    err('shader translation failed (' + stage + '):', String(e && e.message || e).slice(0, 2000));
++    if (W.dumpFailed !== false && stats.shaderFails <= 5) console.log('[wgpu] failed GLSL:\n' + glsl);
++    return null;
++  } finally {
++    if (info) info.free();
++    if (m) m.free();
++  }
++}
++// stage: 0 vertex, 1 geometry, 2 pixel, 3 compute
++W.shaderCreate = function(stage, ptr) {
++  var st = stage === 0 ? 'vertex' : stage === 2 ? 'fragment' : null;
++  if (!st) { err('unsupported shader stage', stage); return 0; }
++  var wgsl = toWgsl(env.str(ptr), st);
++  if (!wgsl) return 0;
++  var mod = dev.createShaderModule({ code: wgsl });
++  var binds = [], re = /@group\((\d+)\)\s*@binding\((\d+)\)\s*var(?:<[^>]*>)?\s+\w+\s*:\s*([^;]+);/g, r;
++  while ((r = re.exec(wgsl))) binds.push({ group: +r[1], binding: +r[2], type: r[3].trim() });
++  stats.shaders++;
++  return put({ mod: mod, binds: binds, stage: st, wgsl: wgsl });
++};
++W.shaderDestroy = function(id) { O[id] = null; };
++W._toWgsl = toWgsl; W._initNaga = initNaga;
++// Debugging: list textures / show one in a visible canvas.
++W._read = function(id) {
++  var o = O[id]; if (!o) return Promise.resolve(null);
++  var src = o.f.depth ? shadowOf(o) : o, bpp = src.f.bytes, bpr = align(o.w * bpp, 256);
++  var buf = dev.createBuffer({ size: bpr * o.h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
++  endPass();
++  enc().copyTextureToBuffer({ texture: src.t }, { buffer: buf, bytesPerRow: bpr }, [o.w, o.h, 1]);
++  submit();
++  return buf.mapAsync(GPUMapMode.READ).then(function() {
++    var d = new Uint8Array(buf.getMappedRange()), out = new Uint8Array(o.w * o.h * bpp);
++    for (var r = 0; r < o.h; r++) out.set(d.subarray(r * bpr, r * bpr + o.w * bpp), r * o.w * bpp);
++    buf.unmap(); buf.destroy();
++    var s = ''; for (var i = 0; i < out.length; i += 8192) s += String.fromCharCode.apply(null, out.subarray(i, i + 8192));
++    return { w: o.w, h: o.h, fmt: src.f.name, b64: btoa(s) };
++  });
++};
++W._list = function() { var r = []; O.forEach(function(o, i) { if (o && o.t && o.f) r.push([i, o.w, o.h, o.layers, o.levels, o.f.name]); }); return r; };
++W._show = function(id, x) {
++  var o = O[id]; if (!o) return 'none';
++  var c = document.createElement('canvas'); c.width = o.w; c.height = o.h;
++  c.style.cssText = 'position:fixed;top:0;width:320px;z-index:99999;border:2px solid lime;left:' + (x || 0) + 'px';
++  document.body.appendChild(c);
++  var k = c.getContext('webgpu'), src = o.f.depth ? shadowOf(o) : o;
++  if (src.f.name !== 'rgba8unorm' && src.f.name !== 'bgra8unorm') return 'format ' + src.f.name;
++  k.configure({ device: dev, format: src.f.name, usage: GPUTextureUsage.COPY_DST, alphaMode: 'opaque' });
++  endPass();
++  enc().copyTextureToTexture({ texture: src.t }, { texture: k.getCurrentTexture() }, [o.w, o.h, 1]);
++  submit();
++  return 'ok';
++};
++
++// ---------------- vertex formats ----------------
++// ptr -> int32[]: stride, then 16 x (location, type, components, offset, enable, integer)
++var VTX = {
++  0: ['uint8', 'uint8x2', 'uint8x4', 'uint8x4', 'unorm8', 'unorm8x2', 'unorm8x4', 'unorm8x4'],
++  1: ['sint8', 'sint8x2', 'sint8x4', 'sint8x4', 'snorm8', 'snorm8x2', 'snorm8x4', 'snorm8x4'],
++  2: ['uint16', 'uint16x2', 'uint16x4', 'uint16x4', 'unorm16', 'unorm16x2', 'unorm16x4', 'unorm16x4'],
++  3: ['sint16', 'sint16x2', 'sint16x4', 'sint16x4', 'snorm16', 'snorm16x2', 'snorm16x4', 'snorm16x4'] };
++var VSIZEB = { 0: 1, 1: 1, 2: 2, 3: 2 };
++W.vfmtCreate = function(ptr) {
++  var a = new Int32Array(H().buffer, ptr, 1 + 16 * 6), stride = a[0], attrs = [];
++  for (var i = 0; i < 16; i++) {
++    var b = 1 + i * 6;
++    if (!a[b + 4]) continue;
++    var type = a[b + 1], n = a[b + 2], off = a[b + 3], integer = a[b + 5], f;
++    if (type >= 4) f = n === 1 ? 'float32' : 'float32x' + n;
++    else {
++      f = VTX[type][(integer ? 0 : 4) + n - 1];
++      if (n === 3 && off + 4 * VSIZEB[type] > stride) { err('vertex attribute does not fit', i); continue; }
++    }
++    attrs.push({ shaderLocation: a[b], format: f, offset: off });
++  }
++  return put({ stride: stride, attrs: attrs });
++};
++
++// ---------------- pipelines ----------------
++var CMP = ['never', 'greater', 'equal', 'greater-equal', 'less', 'not-equal', 'less-equal', 'always'];
++function srcF(v, dual) { return ['zero', 'one', 'dst', 'one-minus-dst', dual ? 'src1-alpha' : 'src-alpha', dual ? 'one-minus-src1-alpha' : 'one-minus-src-alpha', 'dst-alpha', 'one-minus-dst-alpha'][v]; }
++function dstF(v, dual) { return ['zero', 'one', 'src', 'one-minus-src', dual ? 'src1-alpha' : 'src-alpha', dual ? 'one-minus-src1-alpha' : 'one-minus-src-alpha', 'dst-alpha', 'one-minus-dst-alpha'][v]; }
++function bindEntry(b) {
++  var vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, t = b.type;
++  if (t === 'sampler') return { binding: b.binding, visibility: vis, sampler: { type: 'filtering' } };
++  var m = /^texture_(2d_array|2d|3d|cube)<(f32|u32|i32)>$/.exec(t);
++  if (!m) return null;
++  return { binding: b.binding, visibility: vis, texture: {
++    sampleType: m[2] === 'f32' ? 'float' : m[2] === 'u32' ? 'uint' : 'sint', viewDimension: m[1].replace('_', '-') } };
++}
++// usage: 0 GX, 1 GX ubershader, 2 utility
++W.pipelineCreate = function(vs, fs, vf, raster, depth, blend, fbst, usage) {
++  var V = O[vs], F = fs ? O[fs] : null, VF = vf ? O[vf] : null;
++  if (!V || (fs && !F)) return 0;
++  var ents = {}, list = [];
++  [V, F].forEach(function(S) { if (S) S.binds.forEach(function(b) { if (b.group === 1 && !ents[b.binding]) { var e = bindEntry(b); if (e) { ents[b.binding] = e; list.push(e); } } }); });
++  list.sort(function(a, b) { return a.binding - b.binding; });
++  var bgl1 = dev.createBindGroupLayout({ entries: list });
++  var layout = dev.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
++  var prim = (raster >> 3) & 3, cull = raster & 3;
++  var colorFmt = FMT[fbst & 255], depthFmt = FMT[(fbst >> 8) & 255], adds = (fbst >>> 25) & 7;
++  var dual = (blend >> 7) & 1;
++  var targets = [];
++  if (colorFmt && !colorFmt.depth) {
++    var t = { format: colorFmt.name, writeMask: ((blend >> 3) & 1 ? 7 : 0) | ((blend >> 4) & 1 ? 8 : 0) };
++    if (blend & 1) t.blend = {
++      color: { srcFactor: srcF((blend >> 11) & 7, dual), dstFactor: dstF((blend >> 8) & 7, dual), operation: (blend >> 5) & 1 ? 'reverse-subtract' : 'add' },
++      alpha: { srcFactor: srcF((blend >> 17) & 7, dual), dstFactor: dstF((blend >> 14) & 7, dual), operation: (blend >> 6) & 1 ? 'reverse-subtract' : 'add' } };
++    targets.push(t);
++    for (var i = 0; i < adds; i++) targets.push({ format: colorFmt.name, writeMask: t.writeMask });
++  }
++  var desc = {
++    layout: layout,
++    vertex: { module: V.mod, entryPoint: 'main', buffers: VF && VF.attrs.length ? [{ arrayStride: VF.stride, attributes: VF.attrs }] : [] },
++    primitive: { topology: ['point-list', 'line-list', 'triangle-list', 'triangle-strip'][prim], cullMode: cull === 1 ? 'back' : cull === 2 ? 'front' : 'none', frontFace: 'cw' },
++    multisample: { count: 1 } };
++  if (prim === 3) desc.primitive.stripIndexFormat = 'uint16';
++  if (F) desc.fragment = { module: F.mod, entryPoint: 'main', targets: targets };
++  if (depthFmt && depthFmt.depth) {
++    var test = depth & 1;
++    desc.depthStencil = { format: depthFmt.name, depthWriteEnabled: !!(test && (depth >> 1) & 1), depthCompare: test ? CMP[(depth >> 2) & 7] : 'always' };
++  }
++  var pl;
++  try { pl = dev.createRenderPipeline(desc); } catch (e) { err('pipeline creation threw', e); return 0; }
++  stats.pipelines++;
++  return put({ pl: pl, bgl1: bgl1, ents: list, usage: usage, bg: new Map(), epoch: 0 });
++};
++W.pipelineDestroy = function(id) { O[id] = null; };
++W.setPipeline = function(id) { if (curPipe !== id) { curPipe = id; dPipe = true; dBG0 = true; } };
++
++function bindGroup1(p) {
++  if (!p.ents.length) return null;
++  if (p.epoch !== bgCacheEpoch) { p.bg.clear(); p.epoch = bgCacheEpoch; }
++  var res = [], key = curFb + ':';
++  for (var i = 0; i < p.ents.length; i++) {
++    var e = p.ents[i], slot = e.binding >> 1, r;
++    if (e.sampler) {
++      r = samplers[slot] || (samplers[slot] = dev.createSampler({}));
++      key += 's' + (r.__id || (r.__id = ++bindId));
++    } else {
++      var o = slots[slot] || dummy, fb = O[curFb];
++      // a texture can't be sampled while it's an attachment of this pass
++      if (fb && (o === fb.color || o === fb.depth || fb.adds.indexOf(o) >= 0)) o = dummy;
++      if (o.f.depth) o = shadowOf(o);
++      var dim = e.texture.viewDimension === '2d' ? '2d' : 'arr';
++      r = view(o, dim);
++      key += 't' + (r.__id || (r.__id = ++bindId));
++    }
++    res.push({ binding: e.binding, resource: r });
++  }
++  var bg = p.bg.get(key);
++  if (!bg) {
++    bg = dev.createBindGroup({ layout: p.bgl1, entries: res });
++    if (p.bg.size > 256) p.bg.clear();
++    p.bg.set(key, bg);
++  }
++  return bg;
++}
++var bindId = 0;
++
++// ---------------- buffers ----------------
++function ringWrap() { submit(); vpos = ipos = upos = 0; dVB = true; }
++W.vertices = function(ptr, size, stride) {
++  var a = stride % 4 ? stride * 4 : stride;
++  var off = align(vpos, a), sz = align(size, 4);
++  if (off + sz > VSIZE) { ringWrap(); off = 0; }
++  queue.writeBuffer(vbuf, off, H(), ptr, sz);
++  vpos = off + sz;
++  return stride ? off / stride : 0;
++};
++W.indices = function(ptr, count) {
++  var off = align(ipos, 4), sz = align(count * 2, 4);
++  if (off + sz > ISIZE) { ringWrap(); off = 0; }
++  queue.writeBuffer(ibuf, off, H(), ptr, sz);
++  ipos = off + sz;
++  return off / 2;
++};
++// slot 0 PS, 1 VS, 2 GS, 3 utility
++W.uniforms = function(slot, ptr, size) {
++  var off = align(upos, 256);
++  if (off + UBIND > USIZE) { ringWrap(); off = 0; }
++  queue.writeBuffer(ubuf, off, H(), ptr, align(size, 4));
++  upos = off + align(size, 4);
++  if (slot === 3) utilOff = off; else gxOff[slot] = off;
++  dBG0 = true;
++};
++
++// ---------------- drawing ----------------
++function applyState() {
++  if (!beginPass()) return false;
++  var p = O[curPipe];
++  if (!p) return false;
++  var fb = O[curFb];
++  if (dPipe) { pass.setPipeline(p.pl); dPipe = false; dBG1 = true; }
++  if (dVP) {
++    var x = Math.max(0, vp[0]), y = Math.max(0, vp[1]);
++    var w = Math.min(fb.w, vp[0] + vp[2]) - x, h = Math.min(fb.h, vp[1] + vp[3]) - y;
++    var n = Math.min(1, Math.max(0, vp[4])), f = Math.min(1, Math.max(0, vp[5]));
++    if (w > 0 && h > 0) pass.setViewport(x, y, w, h, Math.min(n, f), Math.max(n, f));
++    dVP = false;
++  }
++  if (dSC) {
++    var sx = Math.max(0, Math.min(fb.w, sc[0])), sy = Math.max(0, Math.min(fb.h, sc[1]));
++    var sw = Math.max(0, Math.min(fb.w, sc[0] + sc[2]) - sx), sh = Math.max(0, Math.min(fb.h, sc[1] + sc[3]) - sy);
++    pass.setScissorRect(sx, sy, sw, sh);
++    dSC = false;
++  }
++  if (dVB) { pass.setVertexBuffer(0, vbuf); pass.setIndexBuffer(ibuf, 'uint16'); dVB = false; }
++  if (dBG0) {
++    var u = p.usage === 2 ? [utilOff, utilOff, utilOff] : gxOff;
++    pass.setBindGroup(0, bg0, u);
++    dBG0 = false;
++  }
++  if (dBG1) { var bg = bindGroup1(p); if (bg) pass.setBindGroup(1, bg); dBG1 = false; }
++  return true;
++}
++W.draw = function(base, count) { stats['fb' + curFb] = (stats['fb' + curFb] || 0) + 1; if (applyState()) { pass.draw(count, 1, base, 0); stats.draws++; } else stats.skipped = (stats.skipped || 0) + 1; };
++W.drawIndexed = function(bi, count, bv) { stats['fb' + curFb] = (stats['fb' + curFb] || 0) + 1; if (applyState()) { pass.drawIndexed(count, 1, bi, bv, 0); stats.draws++; } else stats.skipped = (stats.skipped || 0) + 1; };
++
++// ---------------- readback / staging ----------------
++W.stCreate = function() { return put({ jobs: [], done: [] }); };
++W.stDestroy = function(id) { O[id] = null; };
++W.stCopyFrom = function(sid, tid, layer, level, sx, sy, w, h, dstOff, dstStride) {
++  var s = O[sid], o = O[tid];
++  if (!s || !o) return;
++  if (o.fmt === 10) return;  // depth24plus can't be copied out
++  var bpt = o.f.bytes, bpr = align(w * bpt, 256);
++  var buf = dev.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
++  endPass();
++  enc().copyTextureToBuffer({ texture: o.t, mipLevel: level, origin: [sx, sy, layer], aspect: o.f.depth ? 'depth-only' : 'all' },
++                            { buffer: buf, bytesPerRow: bpr }, [w, h, 1]);
++  s.jobs.push({ buf: buf, bpr: bpr, w: w, h: h, bpt: bpt, off: dstOff, stride: dstStride });
++};
++W.stFlush = function(sid) {
++  var s = O[sid];
++  if (!s || !s.jobs.length) return;
++  submit();
++  s.jobs.forEach(function(j) {
++    j.buf.mapAsync(GPUMapMode.READ).then(function() {
++      j.data = new Uint8Array(j.buf.getMappedRange()).slice();
++      j.buf.unmap(); j.buf.destroy();
++      s.done.push(j);
++    }, function() { j.buf.destroy(); });
++  });
++  s.jobs = [];
++};
++// Copies results that have arrived (readbacks finish a frame or more later).
++W.stRead = function(sid, ptr) {
++  var s = O[sid];
++  if (!s) return 0;
++  var n = s.done.length, heap = H();
++  s.done.forEach(function(j) {
++    for (var r = 0; r < j.h; r++) heap.set(j.data.subarray(r * j.bpr, r * j.bpr + j.w * j.bpt), ptr + j.off + r * j.stride);
++  });
++  s.done = [];
++  return n;
++};
++
++// ---------------- present ----------------
++// The picture goes to RetroArch's WebGL framebuffer. Two ways to get it there:
++//  - readback (default): copy to a mappable buffer, upload to a GL texture when
++//    the map completes (a frame or two of latency, ~1 MB per frame through the CPU);
++//  - canvas (DOLPHIN_WEBGPU_PRESENT=1): copy into a WebGPU canvas and texImage2D
++//    from it. GPU-only, but returned blank in headless SwiftShader testing.
++var cv = null, cctx = null, cfmt = null, glTex = null, glFbo = null, glW = 0, glH = 0;
++var rb = [], rbData = null, rbW = 0, rbH = 0, rbFresh = false;
++function readbackFrame(o) {
++  var bpr = align(o.w * 4, 256), size = bpr * o.h, b = null;
++  for (var i = 0; i < rb.length; i++) if (!rb[i].busy && rb[i].size === size) { b = rb[i]; break; }
++  if (!b) {
++    if (rb.length >= 3) { rb = rb.filter(function(x) { return x.busy; }); if (rb.length >= 3) { submit(); return; } }
++    b = { buf: dev.createBuffer({ size: size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), size: size, busy: false };
++    rb.push(b);
++  }
++  endPass();
++  enc().copyTextureToBuffer({ texture: o.t }, { buffer: b.buf, bytesPerRow: bpr }, [o.w, o.h, 1]);
++  submit();
++  b.busy = true;
++  var w = o.w, h = o.h;
++  b.buf.mapAsync(GPUMapMode.READ).then(function() {
++    var d = new Uint8Array(b.buf.getMappedRange());
++    if (!rbData || rbData.length !== w * h * 4) rbData = new Uint8Array(w * h * 4);
++    if (bpr === w * 4) rbData.set(d.subarray(0, w * h * 4));
++    else for (var r = 0; r < h; r++) rbData.set(d.subarray(r * bpr, r * bpr + w * 4), r * w * 4);
++    b.buf.unmap(); b.busy = false;
++    rbW = w; rbH = h; rbFresh = true;
++  }, function() { b.busy = false; });
++}
++W.present = function(tid, raFbo) {
++  stats.presentTex = tid; stats.presentFbo = raFbo;
++  var o = O[tid];
++  if (!o) { submit(); return; }
++  var useCanvas = !!globalThis.DOLPHIN_WEBGPU_PRESENT;
++  if (useCanvas) {
++    if (!cv) {
++      cv = document.createElement('canvas'); cctx = cv.getContext('webgpu');
++      if (globalThis.DOLPHIN_WEBGPU_SHOW) { cv.style.cssText = 'position:fixed;left:0;top:0;width:480px;z-index:99999;border:2px solid red'; document.body.appendChild(cv); }
++    }
++    if (cv.width !== o.w || cv.height !== o.h) { cv.width = o.w; cv.height = o.h; cfmt = null; }
++    if (cfmt !== o.f.name) {
++      cfmt = o.f.name;
++      cctx.configure({ device: dev, format: cfmt, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT, alphaMode: 'opaque' });
++    }
++    endPass();
++    enc().copyTextureToTexture({ texture: o.t }, { texture: cctx.getCurrentTexture() }, [o.w, o.h, 1]);
++    submit();
++  } else {
++    readbackFrame(o);
++  }
++  var gl = env.gl();
++  if (!gl) return;
++  if (!glTex) { glTex = gl.createTexture(); glFbo = gl.createFramebuffer(); }
++  var pTex = gl.getParameter(gl.TEXTURE_BINDING_2D), pRead = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING),
++      pDraw = gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING), sci = gl.isEnabled(gl.SCISSOR_TEST);
++  gl.bindTexture(gl.TEXTURE_2D, glTex);
++  if (useCanvas) {
++    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
++    glW = o.w; glH = o.h;
++  } else if (rbFresh) {
++    var pPBO = gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING), pRow = gl.getParameter(gl.UNPACK_ROW_LENGTH),
++        pAl = gl.getParameter(gl.UNPACK_ALIGNMENT), pSkR = gl.getParameter(gl.UNPACK_SKIP_ROWS), pSkP = gl.getParameter(gl.UNPACK_SKIP_PIXELS);
++    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
++    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
++    gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0); gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
++    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, rbW, rbH, 0, gl.RGBA, gl.UNSIGNED_BYTE, rbData);
++    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, pPBO);
++    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, pRow); gl.pixelStorei(gl.UNPACK_ALIGNMENT, pAl);
++    gl.pixelStorei(gl.UNPACK_SKIP_ROWS, pSkR); gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, pSkP);
++    glW = rbW; glH = rbH; rbFresh = false;
++  }
++  if (glW) {
++    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, glFbo);
++    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glTex, 0);
++    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, raFbo ? env.GL.framebuffers[raFbo] : null);
++    if (sci) gl.disable(gl.SCISSOR_TEST);
++    gl.blitFramebuffer(0, 0, glW, glH, 0, glH, glW, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
++    if (sci) gl.enable(gl.SCISSOR_TEST);
++  }
++  gl.bindTexture(gl.TEXTURE_2D, pTex);
++  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, pRead);
++  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, pDraw);
++};
++return W;
 diff --git a/Source/Core/VideoCommon/BPFunctions.cpp b/Source/Core/VideoCommon/BPFunctions.cpp
 index 134a14f..1c8597a 100644
 --- a/Source/Core/VideoCommon/BPFunctions.cpp
@@ -5158,6 +6774,57 @@ index deb005b..65a1ea1 100644
  constexpr u32 m_os = OS_ALL;
  #endif
  
+diff --git a/Source/Core/VideoCommon/Spirv.cpp b/Source/Core/VideoCommon/Spirv.cpp
+index 9fcef18..4b7b889 100644
+--- a/Source/Core/VideoCommon/Spirv.cpp
++++ b/Source/Core/VideoCommon/Spirv.cpp
+@@ -307,4 +307,26 @@ std::optional<CodeVector> CompileComputeShader(std::string_view source_code, API
+   return CompileShaderToSPV(EShLangCompute, api_type, language_version, "cs", source_code,
+                             shader_includer);
+ }
++
++std::optional<std::string> PreprocessShader(EShLanguage stage, std::string_view source)
++{
++  if (!InitializeGlslang())
++    return std::nullopt;
++  glslang::TShader shader(stage);
++  glslang::TShader::ForbidIncluder forbid_includer;
++  const char* src = source.data();
++  int len = static_cast<int>(source.size());
++  shader.setStringsWithLengths(&src, &len, 1);
++  shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
++  std::string out;
++  const EShMessages messages =
++      static_cast<EShMessages>(EShMsgDefault | EShMsgSpvRules | EShMsgVulkanRules);
++  if (!shader.preprocess(GetCompilerResourceLimits(), 450, ECoreProfile, false, true, messages,
++                         &out, forbid_includer))
++  {
++    ERROR_LOG_FMT(VIDEO, "Shader preprocessing failed: {}", shader.getInfoLog());
++    return std::nullopt;
++  }
++  return out;
++}
+ }  // namespace SPIRV
+diff --git a/Source/Core/VideoCommon/Spirv.h b/Source/Core/VideoCommon/Spirv.h
+index 8a18d5b..b383487 100644
+--- a/Source/Core/VideoCommon/Spirv.h
++++ b/Source/Core/VideoCommon/Spirv.h
+@@ -5,6 +5,7 @@
+ 
+ #include <cstddef>
+ #include <optional>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -38,4 +39,7 @@ std::optional<CodeVector> CompileFragmentShader(std::string_view source_code, AP
+ std::optional<CodeVector> CompileComputeShader(std::string_view source_code, APIType api_type,
+                                                glslang::EShTargetLanguageVersion language_version,
+                                                glslang::TShader::Includer* shader_includer);
++
++// Run only the preprocessor (macros, #if); returns the expanded source.
++std::optional<std::string> PreprocessShader(EShLanguage stage, std::string_view source);
+ }  // namespace SPIRV
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
 index ed07589..6bcce6c 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
@@ -5332,3 +6999,27 @@ index ecdaf5e..79d7472 100644
        // Oversized depth ranges are handled in the vertex shader. We need to reverse
        // the far value to use the reversed-Z trick.
        if (g_backend_info.bSupportsReversedDepthRange)
+diff --git a/Source/Core/VideoCommon/VideoBackendBase.cpp b/Source/Core/VideoCommon/VideoBackendBase.cpp
+index 82cb935..6865090 100644
+--- a/Source/Core/VideoCommon/VideoBackendBase.cpp
++++ b/Source/Core/VideoCommon/VideoBackendBase.cpp
+@@ -31,6 +31,9 @@
+ #include "VideoBackends/D3D12/VideoBackend.h"
+ #endif
+ #include "VideoBackends/Null/VideoBackend.h"
++#ifdef __EMSCRIPTEN__
++#include "VideoBackends/WebGPU/WGPUBackend.h"
++#endif
+ #ifdef HAS_OPENGL
+ #include "VideoBackends/OGL/VideoBackend.h"
+ #include "VideoBackends/Software/VideoBackend.h"
+@@ -228,6 +231,9 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
+ #endif
+ #ifdef HAS_OPENGL
+     backends.push_back(std::make_unique<SW::VideoSoftware>());
++#endif
++#ifdef __EMSCRIPTEN__
++    backends.push_back(std::make_unique<WGPU::VideoBackend>());
+ #endif
+     backends.push_back(std::make_unique<Null::VideoBackend>());
+ 
