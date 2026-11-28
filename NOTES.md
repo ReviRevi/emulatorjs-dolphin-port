@@ -228,6 +228,13 @@ FIFO CPU core breaks after each frame). `scripts/fifoplay.mjs file.dff out.png` 
 headless Chrome. `DOLPHIN_GL_TRACE_FROM=N` (+ `DOLPHIN_GL_TRACE_COUNT`) logs draws, EFB copies
 and clears with their BP/XF state to the console as `[gltrace]`.
 
+### Profiling compiled blocks
+
+Each compiled block's module carries a name section, so Chrome profiles show `ppc_<address>`
+instead of `wasm-function[0]`. `EJS_emulator.Module._dolphin_disasm(0x80123456, 40)` prints the
+PowerPC instructions there (console). TTYD (2026-11-27): main thread 97% busy, 73% in compiled
+blocks: CPU-bound, unlike Mario Superstar Baseball (GPU-process-bound: draw-call count).
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.

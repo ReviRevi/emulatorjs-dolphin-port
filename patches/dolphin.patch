@@ -475,10 +475,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..adc6cc8
+index 0000000..808b844
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2691 @@
+@@ -0,0 +1,2719 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -507,6 +507,7 @@ index 0000000..adc6cc8
 +#include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
 +
 +#include <cmath>
++#include <cstdio>
 +#include <cstddef>
 +#include <functional>
 +#include <ostream>
@@ -546,6 +547,7 @@ index 0000000..adc6cc8
 +// JIT mode, from the page: globalThis.DOLPHIN_WASM_JIT = 0 (off: plain Cached
 +// Interpreter), 1 (compile blocks, but only as calls into the Interpreter) or
 +// 2 (default: inline code). Read when a block is compiled.
++EM_JS(void, dolphin_print_text, (const char* text), { console.log(UTF8ToString(text)); });
 +EM_JS(int, dolphin_wasm_jit_mode, (), {
 +  var m = globalThis["DOLPHIN_WASM_JIT"];
 +  return typeof m === "number" ? m : 2;
@@ -3158,8 +3160,10 @@ index 0000000..adc6cc8
 +
 +  c.End();        // loop
 +  c.I32Const(0);  // not reached: every block ends in EndBlock
++  char name[24];
++  std::snprintf(name, sizeof(name), "ppc_%08x", block.effectiveAddress);
 +  const std::vector<u8> module =
-+      BuildModule({{L_I32_COUNT, I32}, {L_I64_COUNT, I64}, {L_F64_COUNT, F64}}, c.bytes);
++      BuildModule({{L_I32_COUNT, I32}, {L_I64_COUNT, I64}, {L_F64_COUNT, F64}}, c.bytes, name);
 +  const int fn = dolphin_wasm_jit_install(module.data(), static_cast<int>(module.size()));
 +  if (fn <= 0)
 +  {
@@ -3170,6 +3174,30 @@ index 0000000..adc6cc8
 +}
 +
 +#endif  // __EMSCRIPTEN__
++
++#ifdef __EMSCRIPTEN__
++#include "Common/GekkoDisassembler.h"
++#include "Core/Core.h"
++#include "Core/PowerPC/MMU.h"
++#include "Core/System.h"
++
++// Console helper for profiling: a profile names compiled blocks ppc_<address>;
++//   EJS_emulator.Module._dolphin_disasm(0x80123456, 40)
++// prints that many PowerPC instructions from there.
++extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_disasm(u32 address, int count)
++{
++  Core::System& system = Core::System::GetInstance();
++  Core::CPUThreadGuard guard(system);
++  std::string out;
++  for (int i = 0; i < count; i++)
++  {
++    const u32 a = address + 4 * i;
++    const u32 op = PowerPC::MMU::HostRead_Instruction(guard, a);
++    out += fmt::format("{:08x}  {:08x}  {}\n", a, op, Common::GekkoDisassembler::Disassemble(op, a));
++  }
++  dolphin_print_text(out.c_str());
++}
++#endif
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
 index 6653297..95ceb68 100644
 --- a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreter_Disassembler.cpp
@@ -3186,10 +3214,10 @@ index 6653297..95ceb68 100644
  #undef LOOKUP_KV
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
 new file mode 100644
-index 0000000..494bf76
+index 0000000..d8b0c10
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,329 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -3411,7 +3439,7 @@ index 0000000..494bf76
 +// Wraps a function body (locals + code) into a complete module.
 +// `locals` lists extra local declarations as (count, type) pairs.
 +inline std::vector<u8> BuildModule(const std::vector<std::pair<u32, u8>>& locals,
-+                                   const std::vector<u8>& code)
++                                   const std::vector<u8>& code, const char* name = nullptr)
 +{
 +  CodeWriter m;
 +  // magic + version
@@ -3500,6 +3528,21 @@ index 0000000..494bf76
 +    s.U32(static_cast<u32>(body.bytes.size()));
 +    s.Append(body.bytes);
 +    section(10, s);
++  }
++  // Name section: profilers show the function under this name (e.g. the PPC
++  // block address) instead of wasm-function[0].
++  if (name)
++  {
++    CodeWriter names;  // subsection 1: function names
++    names.U32(1);
++    names.U32(0);
++    names.Name(name);
++    CodeWriter s;
++    s.Name("name");
++    s.Byte(1);
++    s.U32(static_cast<u32>(names.bytes.size()));
++    s.Append(names.bytes);
++    section(0, s);
 +  }
 +  return std::move(m.bytes);
 +}
