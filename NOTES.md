@@ -497,3 +497,32 @@ EM_JS call now checks the thread; off the main thread it runs synchronously
 on the main thread (emscripten system proxying queue) and logs
 `[wgpu] call from a non-main thread, proxied: <name>` with a stack trace,
 once per function. Headless test programs log none.
+
+### Performance batch (SIMD, canvas present, per-draw trims, async pipelines) + save states on main
+
+- **WebAssembly SIMD:** `-msimd128` for `common`, `videocommon` and `xxhash`
+  (texture decoding, hashing, vertex loops get auto-vectorized). xxhash.h
+  includes the NEON compat header inside `extern "C"` under SIMD128, which
+  breaks C++; those targets force-include `arm_neon.h` first and use
+  `XXH_VECTOR=0` for the inline header (the xxhash library itself keeps SIMD).
+- **Present:** the WebGPU canvas path is now the default (GPU copy, no ~1 MB
+  CPU readback, no extra frame of latency). `DOLPHIN_WEBGPU_PRESENT=0` restores
+  the readback. It rendered blank in headless SwiftShader; untested on real GPUs.
+- **Per draw:** viewport/scissor dedupe without allocating, numeric sampler
+  keys, no per-draw stats string, bind group reused without building a key
+  when the textures/samplers match the pipeline's last draw.
+- **Async pipelines:** game (GX) pipelines use `createRenderPipelineAsync`; draws
+  are skipped until ready (Dolphin's skip-drawing async mode). Utility
+  pipelines stay synchronous. `DOLPHIN_WEBGPU_SYNC_PIPELINES=1` turns it off.
+  Shader translation (GLSL to WGSL via naga) is still synchronous, so a first-use
+  hitch can remain.
+- **Save states in dual core** now run on the main thread with the CPU paused
+  (`CPUThreadGuard`), instead of the measuring pass running on the CPU thread
+  and touching the video state from a thread with no WebGPU device. Suspected
+  cause of the smear that appears right after a short stall (the 30 s autosave).
+
+Headless: fpbench/brtest checksums correct in GL, WebGPU and WebGPU dual core;
+FIFO replay of the baseball menu identical with async vs sync pipelines; 30
+saves without a hang in WebGPU single and dual core. (State tests need
+`--enable-unsafe-webgpu --use-webgpu-adapter=swiftshader`, otherwise the
+backend never starts and a save dereferences a null framebuffer manager.)
