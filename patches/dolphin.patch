@@ -397,10 +397,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..41de1d9
+index 0000000..adc6cc8
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2533 @@
+@@ -0,0 +1,2691 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -428,6 +428,7 @@ index 0000000..41de1d9
 +
 +#include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
 +
++#include <cmath>
 +#include <cstddef>
 +#include <functional>
 +#include <ostream>
@@ -750,6 +751,34 @@ index 0000000..41de1d9
 +      c.I32And();
 +      break;
 +    }
++  }
++  // ConditionRegister::GetField: the 4-bit LT|GT|EQ|SO value of a CR field.
++  void PushCRField(u32 crf)
++  {
++    for (u32 i = 0; i < 4; i++)
++    {
++      PushCRBit(crf * 4 + i);
++      if (i != 3)
++      {
++        c.I32Const(3 - i);
++        c.I32Shl();
++      }
++      if (i != 0)
++        c.I32Or();
++    }
++  }
++  // ConditionRegister::SetField from the 4-bit value on the stack.
++  void StoreCRField(u32 crf)
++  {
++    c.I32Const(3);
++    c.I32Shl();
++    c.I32ConstU(m.cr_table);
++    c.I32Add();
++    c.I64Load();
++    c.LocalSet(L_X);
++    c.I32ConstU(m.ppc);
++    c.LocalGet(L_X);
++    c.I64Store(m.cr + 8 * crf);
 +  }
 +  void PushSPR(u32 index)
 +  {
@@ -1236,11 +1265,19 @@ index 0000000..41de1d9
 +  GROUP_FP_COMPARE = 32,   // fcmpu/fcmpo/ps_cmp*
 +  GROUP_PS_ARITH = 64,     // ps arithmetic
 +  GROUP_INTEGER = 128,     // everything outside EmitInlineFP
++  GROUP_CR = 256,          // CR logic ops, mcrf, mfcr, mtcrf
 +};
 +static u32 s_disabled_groups = 0;
 +static bool Enabled(u32 group)
 +{
 +  return (s_disabled_groups & group) == 0;
++}
++
++// std::fma as the Interpreter computes it (WebAssembly has no fused multiply-add):
++// called from compiled blocks through the function table.
++static double WasmJitFma(double a, double b, double c)
++{
++  return std::fma(a, b, c);
 +}
 +
 +static bool EmitInlineFP(Emitter& e, UGeckoInstruction inst, bool& handled,
@@ -1493,6 +1530,16 @@ index 0000000..41de1d9
 +  case 57: return fpmem(Mem::PSQ_L, ea_qu, true, inst.W, inst.I);
 +  case 60: return fpmem(Mem::PSQ_ST, ea_q, false, inst.W, inst.I);
 +  case 61: return fpmem(Mem::PSQ_ST, ea_qu, true, inst.W, inst.I);
++  case 4:
++    switch (inst.SUBOP6)
++    {
++    case 6: return fpmem(Mem::PSQ_L, ea_x, false, inst.Wx, inst.Ix);    // psq_lx
++    case 7: return fpmem(Mem::PSQ_ST, ea_x, false, inst.Wx, inst.Ix);   // psq_stx
++    case 38: return fpmem(Mem::PSQ_L, ea_xu, true, inst.Wx, inst.Ix);   // psq_lux
++    case 39: return fpmem(Mem::PSQ_ST, ea_xu, true, inst.Wx, inst.Ix);  // psq_stux
++    default: break;
++    }
++    break;
 +  case 31:
 +    switch (inst.SUBOP10)
 +    {
@@ -1508,7 +1555,6 @@ index 0000000..41de1d9
 +    }
 +  case 59:
 +  case 63:
-+  case 4:
 +    break;
 +  default:
 +    handled = false;
@@ -1649,6 +1695,33 @@ index 0000000..41de1d9
 +            e.StorePSFromLocal(fd, 0, L_F2);
 +          },
 +          false);
++    case 28:  // fmsub
++    case 29:  // fmadd
++    case 30:  // fnmsub
++    case 31:  // fnmadd
++    {
++      // NI_madd_msub<double>: fma(a, c, +-b); NaN results -> Interpreter.
++      const bool sub = inst.SUBOP5 == 28 || inst.SUBOP5 == 30;
++      const bool neg = inst.SUBOP5 >= 30;
++      return with_fallback(
++          [&] {
++            e.PushPS(fa, 0);
++            e.PushPS(fc, 0);
++            e.PushPS(fb, 0);
++            if (sub)
++              c.F64Neg();
++            c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(&WasmJitFma)));
++            c.CallIndirect(WasmJit::TYPE_F_FFF);
++            c.LocalSet(L_F0);
++            e.BrIfNaN(L_F0, 0);
++            e.ForceDouble(L_F0);
++            if (neg)
++              c.F64Neg();
++            c.LocalSet(L_F2);
++            e.StorePSFromLocal(fd, 0, L_F2);
++          },
++          false);
++    }
 +    case 23:  // fsel: ps0 = a >= -0.0 ? c : b
 +      e.PushPSBits(fc, 0);
 +      e.PushPSBits(fb, 0);
@@ -1917,6 +1990,51 @@ index 0000000..41de1d9
 +          },
 +          inst.LK_3);
 +      c.End();
++      return true;
++    }
++  }
++
++  // ---- CR logic (Interpreter_SystemRegisters.cpp) ----
++  if (inst.OPCD == 19 && Enabled(GROUP_CR))
++  {
++    const u32 xo = inst.SUBOP10;
++    if (xo == 0)  // mcrf
++    {
++      e.PushCRField(inst.CRFS);
++      e.StoreCRField(inst.CRFD);
++      return true;
++    }
++    if (xo == 150)  // isync: nothing to do
++      return true;
++    if (xo == 33 || xo == 129 || xo == 193 || xo == 225 || xo == 257 || xo == 289 || xo == 417 ||
++        xo == 449)
++    {
++      const u32 bd = inst.CRBD;
++      const u32 shift = 3 - (bd & 3);
++      // field with bit bd cleared | (a OP b) << shift
++      e.PushCRField(bd >> 2);
++      c.I32Const(~(1 << shift) & 0xF);
++      c.I32And();
++      e.PushCRBit(inst.CRBA);
++      e.PushCRBit(inst.CRBB);
++      switch (xo)
++      {
++      case 257: c.I32And(); break;                                   // crand
++      case 129: c.I32Const(1); c.I32Xor(); c.I32And(); break;        // crandc: a & ~b
++      case 289: c.I32Xor(); c.I32Const(1); c.I32Xor(); break;        // creqv
++      case 225: c.I32And(); c.I32Const(1); c.I32Xor(); break;        // crnand
++      case 33: c.I32Or(); c.I32Const(1); c.I32Xor(); break;          // crnor
++      case 449: c.I32Or(); break;                                    // cror
++      case 417: c.I32Const(1); c.I32Xor(); c.I32Or(); break;         // crorc: a | ~b
++      default: c.I32Xor(); break;                                    // crxor
++      }
++      if (shift)
++      {
++        c.I32Const(shift);
++        c.I32Shl();
++      }
++      c.I32Or();
++      e.StoreCRField(bd >> 2);
 +      return true;
 +    }
 +  }
@@ -2365,6 +2483,46 @@ index 0000000..41de1d9
 +    e.SetCarryFromStack();
 +    if (inst.Rc)
 +      e.UpdateCR0(Local::L_V);
++    return true;
++  }
++  case 19:  // mfcr: rD = cr.Get()
++  {
++    if (!Enabled(GROUP_CR))
++      return false;
++    e.SetGPR(rd, [&] {
++      for (u32 f = 0; f < 8; f++)
++      {
++        e.PushCRField(f);
++        if (f != 7)
++        {
++          c.I32Const(28 - 4 * f);
++          c.I32Shl();
++        }
++        if (f != 0)
++          c.I32Or();
++      }
++    });
++    return true;
++  }
++  case 144:  // mtcrf
++  {
++    if (!Enabled(GROUP_CR))
++      return false;
++    const u32 crm = inst.CRM;
++    for (u32 f = 0; f < 8; f++)
++    {
++      if ((crm & (0x80 >> f)) == 0)
++        continue;
++      e.PushGPR(rd);  // RS
++      if (f != 7)
++      {
++        c.I32Const(28 - 4 * f);
++        c.I32ShrU();
++      }
++      c.I32Const(0xF);
++      c.I32And();
++      e.StoreCRField(f);
++    }
 +    return true;
 +  }
 +  case 83:  // mfmsr
@@ -2950,10 +3108,10 @@ index 6653297..95ceb68 100644
  #undef LOOKUP_KV
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
 new file mode 100644
-index 0000000..3b81833
+index 0000000..494bf76
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,314 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -2996,6 +3154,7 @@ index 0000000..3b81833
 +  TYPE_I_III = 6,    // (i32, i32, i32) -> i32
 +  TYPE_V_IIII = 7,   // (i32, i32, i32, i32) -> ()
 +  TYPE_I_V = 8,      // () -> i32               the block function: next block or 0
++  TYPE_F_FFF = 9,    // (f64, f64, f64) -> f64  fma helper
 +  TYPE_COUNT
 +};
 +
@@ -3209,6 +3368,7 @@ index 0000000..3b81833
 +    functype({I32, I32, I32}, {I32});        // TYPE_I_III
 +    functype({I32, I32, I32, I32}, {});      // TYPE_V_IIII
 +    functype({}, {I32});                     // TYPE_I_V
++    functype({F64, F64, F64}, {F64});        // TYPE_F_FFF
 +    section(1, s);
 +  }
 +  // Import section: table and memory
