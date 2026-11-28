@@ -195,6 +195,19 @@ and program binds, flushes); the website overlay shows them per second.
 into one buffer (WebGL has no base vertex, so Dolphin rewrites from offset 0 every flush) to
 glBufferData orphaning, for A/B tests.
 
+### WebGL dual-source blending
+
+Without dual-source blending, Dolphin writes the 6-bit EFB alpha in ocol0.a, and blending uses
+that value too: with a constant destination alpha (`bpmem.dstalpha`), draws blend with the
+constant instead of the fragment's alpha, so things can vanish (Mario Superstar Baseball's menu
+UI). Chrome has `WEBGL_blend_func_extended`: on Emscripten, OGLConfig enables it if a test
+shader with `layout(location = 0, index = 1)` compiles, `FRAGMENT_OUTPUT_LOCATION_INDEXED`
+becomes `layout(location = x, index = y)` (WebGL has no glBindFragDataLocationIndexed), and
+`DOLPHIN_GL_DUALSRC=0` turns it off. `scripts/shadercheck.mjs` boots a test DOL with
+ubershaders precompiled to compile every GX shader variant in headless Chrome: the ubershader
+currently fails (`case label type does not match switch init-expression type`), with or
+without dual-source; ubershaders are off by default.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
