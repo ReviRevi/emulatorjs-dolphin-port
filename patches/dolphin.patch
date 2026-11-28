@@ -4391,11 +4391,141 @@ index 8860a42..3a7abea 100644
    // Get the normal entry for the block associated with the current program
    // counter. This will JIT code if necessary. (This is the reference
    // implementation; high-performance JITs will want to use a custom
+diff --git a/Source/Core/DolphinLibretro/Audio.cpp b/Source/Core/DolphinLibretro/Audio.cpp
+index 04deefa..5285af7 100644
+--- a/Source/Core/DolphinLibretro/Audio.cpp
++++ b/Source/Core/DolphinLibretro/Audio.cpp
+@@ -1,4 +1,9 @@
+ #include <libretro.h>
++#include <mutex>
++#include <vector>
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
+ #include "Audio.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/Thread.h"
+@@ -13,6 +18,37 @@ namespace Audio
+ {
+ retro_audio_sample_batch_t batch_cb = nullptr;
+ 
++#ifdef __EMSCRIPTEN__
++// In dual-core mode the CPU thread (a web worker) produces the samples, but the
++// frontend's audio driver is JavaScript bound to the page's main thread. Samples
++// produced off the main thread are queued and handed over by retro_run.
++static std::mutex s_pending_mutex;
++static std::vector<s16> s_pending;
++static size_t Push(const s16* data, size_t frames)
++{
++  if (emscripten_is_main_runtime_thread())
++    return batch_cb(data, frames);
++  std::lock_guard lock(s_pending_mutex);
++  s_pending.insert(s_pending.end(), data, data + frames * 2);
++  return frames;
++}
++void DrainPendingAudio()
++{
++  std::vector<s16> samples;
++  {
++    std::lock_guard lock(s_pending_mutex);
++    samples.swap(s_pending);
++  }
++  if (batch_cb && !samples.empty())
++    batch_cb(samples.data(), samples.size() / 2);
++}
++#else
++static size_t Push(const s16* data, size_t frames)
++{
++  return batch_cb(data, frames);
++}
++#endif
++
+ static std::atomic<bool> g_buf_support{false};
+ static std::atomic<unsigned> g_buf_occupancy{0};
+ static std::atomic<bool> g_buf_underrun{false};
+@@ -176,20 +212,20 @@ void Stream::Update(unsigned int num_samples)
+ 
+   // First push the minimum threshold block
+   m_mixer->Mix(m_buffer, MIN_SAMPLES);
+-  batch_cb(m_buffer, MIN_SAMPLES);
++  Push(m_buffer, MIN_SAMPLES);
+   avail -= MIN_SAMPLES;
+ 
+   // Then push any remaining in MAX_SAMPLES chunks
+   while (avail > MAX_SAMPLES)
+   {
+     m_mixer->Mix(m_buffer, MAX_SAMPLES);
+-    batch_cb(m_buffer, MAX_SAMPLES);
++    Push(m_buffer, MAX_SAMPLES);
+     avail -= MAX_SAMPLES;
+   }
+   if (avail)
+   {
+     m_mixer->Mix(m_buffer, avail);
+-    batch_cb(m_buffer, avail);
++    Push(m_buffer, avail);
+   }
+ }
+ 
+@@ -208,14 +244,14 @@ void Stream::MixAndPush(unsigned int num_samples)
+   while (avail >= MAX_SAMPLES)
+   {
+     m_mixer->Mix(m_buffer, MAX_SAMPLES);
+-    batch_cb(m_buffer, MAX_SAMPLES);
++    Push(m_buffer, MAX_SAMPLES);
+     avail -= MAX_SAMPLES;
+   }
+   
+   if (avail >= MIN_SAMPLES)
+   {
+     m_mixer->Mix(m_buffer, avail);
+-    batch_cb(m_buffer, avail);
++    Push(m_buffer, avail);
+   }
+   else if (avail > 0)
+   {
+@@ -286,7 +322,7 @@ void Stream::ProcessCallBack()
+     // Use frame time to decide how much to push
+     unsigned to_mix = GetSamplesForFrame(m_sample_rate);
+     m_mixer->Mix(m_buffer, to_mix);
+-    batch_cb(m_buffer, to_mix);
++    Push(m_buffer, to_mix);
+ 
+     return;
+   }
+@@ -295,7 +331,7 @@ void Stream::ProcessCallBack()
+   // Clamp to sane range
+   to_mix = std::clamp(to_mix, MIN_SAMPLES, MAX_SAMPLES);
+   m_mixer->Mix(m_buffer, to_mix);
+-  batch_cb(m_buffer, to_mix);
++  Push(m_buffer, to_mix);
+ }
+ } // namespace Audio
+ 
+diff --git a/Source/Core/DolphinLibretro/Audio.h b/Source/Core/DolphinLibretro/Audio.h
+index 4aa4f14..bbb9eaf 100644
+--- a/Source/Core/DolphinLibretro/Audio.h
++++ b/Source/Core/DolphinLibretro/Audio.h
+@@ -19,6 +19,9 @@ static constexpr unsigned int LEGACY_DEFAULT_SAMPLE_RATE = 32000;
+ 
+ void Reset();
+ void Init();
++#ifdef __EMSCRIPTEN__
++void DrainPendingAudio();  // main thread: samples the CPU thread queued
++#endif
+ unsigned int GetCoreSampleRate();
+ unsigned int GetRetroSampleRate();
+ unsigned int GetActiveSampleRate();
 diff --git a/Source/Core/DolphinLibretro/Boot.cpp b/Source/Core/DolphinLibretro/Boot.cpp
-index 6cee24f..66b2bc4 100644
+index 6cee24f..67dc28e 100644
 --- a/Source/Core/DolphinLibretro/Boot.cpp
 +++ b/Source/Core/DolphinLibretro/Boot.cpp
-@@ -388,7 +388,7 @@ bool retro_load_game(const struct retro_game_info* game)
+@@ -1,3 +1,4 @@
++#include "Common/GL/GLUtil.h"
+ #include <cstdio>
+ #include <libretro.h>
+ #include <string>
+@@ -388,7 +389,7 @@ bool retro_load_game(const struct retro_game_info* game)
              core::CPU_CORE,
              static_cast<int>(PowerPC::DefaultCPUCore()))));
  
@@ -4404,7 +4534,7 @@ index 6cee24f..66b2bc4 100644
    Config::SetBase(Config::MAIN_FASTMEM, false);
    Config::SetBase(Config::MAIN_FASTMEM_ARENA, false);
  #else
-@@ -404,8 +404,17 @@ bool retro_load_game(const struct retro_game_info* game)
+@@ -404,8 +405,19 @@ bool retro_load_game(const struct retro_game_info* game)
                       Libretro::GetOption<bool>(audio::DSP_HLE, /*def=*/true));
  
    // dual core (true) or single core (false)
@@ -4412,7 +4542,9 @@ index 6cee24f..66b2bc4 100644
 +  // WebAssembly: run the whole emulator inside retro_run on the browser's main
 +  // loop. Dual-core mode would block the main thread waiting on workers, and
 +  // worker filesystem calls are proxied to the main thread -> deadlock risk.
-+  Config::SetBase(Config::MAIN_CPU_THREAD, false);
++  // Experimental: globalThis.DOLPHIN_DUALCORE = 1 runs the CPU on its own thread
++  // (a worker) while retro_run does the GPU work on the main thread.
++  Config::SetBase(Config::MAIN_CPU_THREAD, WebGLDebugFlag("DOLPHIN_DUALCORE", 0) != 0);
 +  if (Config::Get(Config::MAIN_CPU_CORE) != PowerPC::CPUCore::Interpreter)
 +    Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::CachedInterpreter);
 +#else
@@ -4439,7 +4571,7 @@ index 159e6a6..361c500 100644
    Boot.cpp
    Host.cpp
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
-index 97ba667..3080081 100644
+index 97ba667..989be33 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp
 +++ b/Source/Core/DolphinLibretro/Main.cpp
 @@ -1,4 +1,8 @@
@@ -4478,6 +4610,16 @@ index 97ba667..3080081 100644
    Libretro::Input::InitSensors();
    Libretro::Options::CheckForUpdatedVariables();
    Libretro::FrameTiming::CheckForFastForwarding();
+@@ -552,6 +569,9 @@ void retro_run(void)
+   }
+ 
+   RETRO_PERFORMANCE_STOP(dolphin_main_func);
++#ifdef __EMSCRIPTEN__
++  Libretro::Audio::DrainPendingAudio();
++#endif
+ 
+   if (Libretro::Input::g_has_microphone_support)
+     poll_microphone();
 diff --git a/Source/Core/DolphinLibretro/Video.cpp b/Source/Core/DolphinLibretro/Video.cpp
 index a2366e7..03f9ae9 100644
 --- a/Source/Core/DolphinLibretro/Video.cpp

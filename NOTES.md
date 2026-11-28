@@ -395,6 +395,22 @@ count against the downcount (slight over-count). `DOLPHIN_WASM_JIT_FWDBRANCH=0` 
 Test: `test-content/brtest` (a copy of the TTYD loop plus nested forward branches): same checksum
 with and without, loop 35.4 -> 43.9 fps headless; fpbench checksum unchanged.
 
+### Dual core (experimental, `DOLPHIN_DUALCORE=1`)
+
+Single core was forced because dual core blocks the main thread waiting for worker threads while
+workers' filesystem calls are proxied to the main thread. With the flag, Boot.cpp leaves
+MAIN_CPU_THREAD on: the CPU runs in a pthread (web worker) and retro_run does the libretro dual
+core frame (DoFrameStep, then RunGpuLoop on the main thread until the CPU thread's StopGpuLoop),
+so the GPU side (FIFO decode, vertex loading, WebGPU/WebGL) overlaps the CPU within each frame.
+Emscripten's main-thread waits spin while processing proxied calls, so the boot-time file reads
+from the CPU thread went through. Fix needed: audio (SYNC_PER_FRAME) is pushed from the CPU
+thread, but RetroArch's audio driver (RWebAudio*) is JS bound to the main thread ("Cannot read
+properties of null (reading 'sampleRate')" in the worker) - samples produced off the main thread
+are queued and handed to batch_cb at the end of retro_run (`Audio::DrainPendingAudio`).
+The JIT compiles and runs blocks on the CPU thread (its own function table), so
+`Module.wasmJitBlocks` / failures are counted on the worker's Module: the overlay's `jit` line
+reads 0 in dual core. Headless: fpbench and brtest checksums match single core (WebGL and WebGPU).
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
