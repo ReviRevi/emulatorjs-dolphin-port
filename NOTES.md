@@ -413,7 +413,12 @@ frame's worth (`Stream::PushAudioForFrame`) on the main thread after each frame.
 The JIT compiles and runs blocks on the CPU thread (its own function table), so
 `Module.wasmJitBlocks` / failures are counted on the worker's Module: the overlay's `jit` line
 reads 0 in dual core. Headless: fpbench and brtest checksums match single core (WebGL and WebGPU).
-First real test (baseball): stadium load 82-84% (vs ~60%), gameplay unchanged at 50-60% - the
+Each thread has its own wasm function table: the first real dual-core boot died with
+"WebAssembly.Table.set(): invalid" when a block compiled on the CPU thread was destroyed from the
+main thread. `dolphin_wasm_jit_install` now records the slots it fills (`Module.__wasmJitOwn`, per
+thread) and `dolphin_wasm_jit_free` only frees those; a slot owned by another thread is left
+allocated there (the block's entry.fn is cleared, so it's never called).
+First real test (baseball, actually still single core - the flag wasn't set): stadium load 82-84% (vs ~60%), gameplay unchanged at 50-60% - the
 threads don't overlap much in gameplay yet; needs a dual-core trace (main vs worker timelines).
 
 ## Known issues / TODO (rough priority)

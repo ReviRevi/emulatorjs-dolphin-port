@@ -882,10 +882,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..e5a9ad5
+index 0000000..0a97feb
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,3125 @@
+@@ -0,0 +1,3134 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -949,6 +949,7 @@ index 0000000..e5a9ad5
 +    var free = Module["__wasmJitFree"] || (Module["__wasmJitFree"] = []);
 +    var idx = free.length ? free.pop() : wasmTable.grow(1);
 +    wasmTable.set(idx, inst.exports["f"]);
++    (Module["__wasmJitOwn"] || (Module["__wasmJitOwn"] = {}))[idx] = 1;
 +    Module["wasmJitBlocks"] = (Module["wasmJitBlocks"] || 0) + 1;
 +    return idx;
 +  } catch (e) {
@@ -1001,7 +1002,15 @@ index 0000000..e5a9ad5
 +  s[n] = (s[n] || 0) + 1;
 +});
 +
++// Every thread has its own function table. In dual core, blocks are compiled
++// and installed on the CPU thread (a worker), but may be destroyed from another
++// thread: only free slots this thread installed (other threads' indices could
++// name unrelated functions here). A slot installed elsewhere just stays
++// allocated there; the block's entry no longer points at it.
 +EM_JS(void, dolphin_wasm_jit_free, (int idx), {
++  var own = Module["__wasmJitOwn"];
++  if (!own || !own[idx]) return;
++  delete own[idx];
 +  wasmTable.set(idx, null);
 +  (Module["__wasmJitFree"] || (Module["__wasmJitFree"] = [])).push(idx);
 +});
