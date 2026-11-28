@@ -14,6 +14,21 @@ index b5862b3..e95cc33 100644
  ifeq ($(HAVE_STATIC_DUMMY),1)
    DEFINES += -DHAVE_STATIC_DUMMY
  else
+diff --git a/emscripten/library_platform_emscripten.js b/emscripten/library_platform_emscripten.js
+index 73ff846..77085ee 100644
+--- a/emscripten/library_platform_emscripten.js
++++ b/emscripten/library_platform_emscripten.js
+@@ -161,7 +161,10 @@ var LibraryPlatformEmscripten = {
+    $PlatformEmscriptenDoSetWakeLock: async function(state) {
+       if (state && !RPE.sentinelPromise && navigator?.wakeLock?.request) {
+          try {
++            // Rejects when the page isn't visible (e.g. a background tab):
++            // harmless, but catch it so it isn't an uncaught error.
+             RPE.sentinelPromise = navigator.wakeLock.request("screen");
++            RPE.sentinelPromise.catch(function() { RPE.sentinelPromise = null; });
+          } catch (e) {}
+       } else if (!state && RPE.sentinelPromise) {
+          try {
 diff --git a/emulatorjs/build-emulatorjs.sh b/emulatorjs/build-emulatorjs.sh
 index 3c05ecf..f0cacec 100755
 --- a/emulatorjs/build-emulatorjs.sh
