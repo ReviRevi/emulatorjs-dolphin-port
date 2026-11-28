@@ -53,10 +53,10 @@ index 66a074a..595001e 100644
    target_sources(common PRIVATE
      Logging/ConsoleListenerDroid.cpp
 diff --git a/Source/Core/Common/GL/GLUtil.h b/Source/Core/Common/GL/GLUtil.h
-index a2225ec..b2598f4 100644
+index a2225ec..a6cbc3a 100644
 --- a/Source/Core/Common/GL/GLUtil.h
 +++ b/Source/Core/Common/GL/GLUtil.h
-@@ -12,6 +12,31 @@ class GLContext;
+@@ -12,6 +12,36 @@ class GLContext;
  // Texture which we use to not disturb the other bindings.
  constexpr GLenum GL_MUTABLE_TEXTURE_INDEX = GL_TEXTURE10;
  
@@ -78,7 +78,12 @@ index a2225ec..b2598f4 100644
 +  unsigned program_binds;
 +  unsigned flushes;
 +  unsigned shader_failures;
++  unsigned feedback_unbinds;
++  unsigned vertex_depth_viewports;
++  unsigned logic_op_draws;
 +};
++// Triage switch read once from globalThis[name] (a number), default `def`.
++int WebGLDebugFlag(const char* name, int def);
 +inline WebGLStats g_webgl_stats{};
 +#define WEBGL_STAT(field, n) (g_webgl_stats.field += (n))
 +#else
@@ -3353,7 +3358,7 @@ index a3f108e..73f84ff 100644
  }
  
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-index ff5402b..c945c2a 100644
+index ff5402b..766c83f 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 @@ -6,6 +6,9 @@
@@ -3366,7 +3371,7 @@ index ff5402b..c945c2a 100644
  #include "Common/Logging/LogManager.h"
  
  #include "VideoBackends/OGL/OGLConfig.h"
-@@ -271,14 +274,68 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+@@ -271,14 +274,84 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
    glDepthRangef(near_depth, far_depth);
  }
  
@@ -3376,7 +3381,8 @@ index ff5402b..c945c2a 100644
 +  Module.dolphinGLStatsNames = ["draws", "buffer_uploads", "buffer_kb", "texture_uploads",
 +                                "texture_kb", "shader_compiles", "program_links", "readbacks",
 +                                "efb_copies", "texture_binds", "program_binds", "flushes",
-+                                "shader_failures"];
++                                "shader_failures", "feedback_unbinds", "vertex_depth_viewports",
++                                "logic_op_draws"];
 +  Module.dolphinGLStats = function() {
 +    var o = {}, base = Module.dolphinGLStatsPtr >> 2;
 +    for (var i = 0; i < Module.dolphinGLStatsNames.length; i++)
@@ -3384,6 +3390,17 @@ index ff5402b..c945c2a 100644
 +    return o;
 +  };
 +});
++#endif
++
++#ifdef __EMSCRIPTEN__
++EM_JS(int, dolphin_debug_flag, (const char* name, int def), {
++  var v = globalThis[UTF8ToString(name)];
++  return v === undefined ? def : (v | 0);
++});
++int WebGLDebugFlag(const char* name, int def)
++{
++  return dolphin_debug_flag(name, def);
++}
 +#endif
 +
 +void OGLGfx::BreakFeedbackLoops()
@@ -3399,6 +3416,9 @@ index ff5402b..c945c2a 100644
 +    published = true;
 +    dolphin_publish_gl_stats(&g_webgl_stats, sizeof(g_webgl_stats) / 4);
 +  }
++  static const bool enabled = WebGLDebugFlag("DOLPHIN_GL_FEEDBACK", 1) != 0;
++  if (!enabled)
++    return;
 +  if (!m_current_framebuffer)
 +    return;
 +  const AbstractTexture* color = m_current_framebuffer->GetColorAttachment();
@@ -3413,6 +3433,7 @@ index ff5402b..c945c2a 100644
 +    glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + i));
 +    glBindTexture(static_cast<const OGLTexture*>(t)->GetGLTarget(), 0);
 +    m_bound_textures[i] = nullptr;
++    WEBGL_STAT(feedback_unbinds, 1);
 +  }
 +}
 +
@@ -3435,7 +3456,7 @@ index ff5402b..c945c2a 100644
    if (g_ogl_config.bSupportsGLBaseVertex)
    {
      glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
-@@ -450,6 +507,7 @@ void OGLGfx::Flush()
+@@ -450,6 +523,7 @@ void OGLGfx::Flush()
    // ensure all commands are sent to the GPU.
    // Otherwise the driver could batch several frames together.
    glFlush();
@@ -3443,7 +3464,7 @@ index ff5402b..c945c2a 100644
  }
  
  void OGLGfx::WaitForGPUIdle()
-@@ -644,6 +702,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
+@@ -644,6 +718,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
    if (m_bound_textures[index] == gl_texture)
      return;
  
@@ -3888,20 +3909,58 @@ index ed07589..bf837d3 100644
    // Emulation methods:
    //
    // - EFB to RAM:
+diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
+index 2d5e28b..d3eac99 100644
+--- a/Source/Core/VideoCommon/VertexManagerBase.cpp
++++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "VideoCommon/VertexManagerBase.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include "Common/GL/GLUtil.h"
++#endif
++
+ #include <array>
+ #include <cmath>
+ #include <memory>
+@@ -438,6 +442,10 @@ void VertexManagerBase::Flush()
+     return;
+ 
+   m_is_flushed = true;
++#ifdef __EMSCRIPTEN__
++  if (bpmem.blendmode.logic_op_enable && !bpmem.blendmode.blend_enable)
++    WEBGL_STAT(logic_op_draws, 1);
++#endif
+ 
+   if (m_draw_counter == 0)
+   {
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
-index ecdaf5e..ed60ca5 100644
+index ecdaf5e..79d7472 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp
 +++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
-@@ -224,7 +224,19 @@ bool VertexShaderManager::UseVertexDepthRange()
+@@ -3,6 +3,10 @@
+ 
+ #include "VideoCommon/VertexShaderManager.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include "Common/GL/GLUtil.h"
++#endif
++
+ #include <array>
+ #include <cmath>
+ #include <cstring>
+@@ -224,7 +228,20 @@ bool VertexShaderManager::UseVertexDepthRange()
  
    // We can't compute the depth range in the vertex shader if we don't support depth clamp.
    if (!g_backend_info.bSupportsDepthClamp)
 +  {
 +#ifdef __EMSCRIPTEN__
++    static const bool vertex_depth = WebGLDebugFlag("DOLPHIN_GL_VTXDEPTH", 1) != 0;
 +    // WebGL rejects an inverted glDepthRange (near > far) and keeps the old range, which can
 +    // hide everything. Map the depth in the vertex shader instead; without depth clamp,
 +    // geometry outside the console's depth range clips instead of clamping.
-+    if (!g_backend_info.bSupportsReversedDepthRange &&
++    if (vertex_depth && !g_backend_info.bSupportsReversedDepthRange &&
 +        (xfmem.viewport.zRange < 0.0f || xfmem.viewport.zRange > xfmem.viewport.farZ))
 +    {
 +      return true;
@@ -3912,3 +3971,11 @@ index ecdaf5e..ed60ca5 100644
  
    // We need a full depth range if a ztexture is used.
    if (bpmem.ztex2.op != ZTexOp::Disabled && !bpmem.zcontrol.early_ztest)
+@@ -451,6 +468,7 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
+ 
+     if (UseVertexDepthRange())
+     {
++      WEBGL_STAT(vertex_depth_viewports, 1);
+       // Oversized depth ranges are handled in the vertex shader. We need to reverse
+       // the far value to use the reversed-Z trick.
+       if (g_backend_info.bSupportsReversedDepthRange)
