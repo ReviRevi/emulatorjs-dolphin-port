@@ -52,6 +52,27 @@ index 66a074a..595001e 100644
  elseif(ANDROID)
    target_sources(common PRIVATE
      Logging/ConsoleListenerDroid.cpp
+diff --git a/Source/Core/Common/GL/GLUtil.cpp b/Source/Core/Common/GL/GLUtil.cpp
+index f447d55..5aeba5a 100644
+--- a/Source/Core/Common/GL/GLUtil.cpp
++++ b/Source/Core/Common/GL/GLUtil.cpp
+@@ -115,3 +115,16 @@ void EnablePrimitiveRestart(const GLContext* context)
+   }
+ }
+ }  // namespace GLUtil
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++
++EM_JS(int, dolphin_debug_flag, (const char* name, int def), {
++  var v = globalThis[UTF8ToString(name)];
++  return v === undefined ? def : (v | 0);
++});
++int WebGLDebugFlag(const char* name, int def)
++{
++  return dolphin_debug_flag(name, def);
++}
++#endif
 diff --git a/Source/Core/Common/GL/GLUtil.h b/Source/Core/Common/GL/GLUtil.h
 index a2225ec..a6cbc3a 100644
 --- a/Source/Core/Common/GL/GLUtil.h
@@ -3518,7 +3539,7 @@ index a3f108e..73f84ff 100644
  }
  
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-index ff5402b..766c83f 100644
+index ff5402b..472a7c0 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 @@ -6,6 +6,9 @@
@@ -3531,7 +3552,7 @@ index ff5402b..766c83f 100644
  #include "Common/Logging/LogManager.h"
  
  #include "VideoBackends/OGL/OGLConfig.h"
-@@ -271,14 +274,84 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+@@ -271,14 +274,74 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
    glDepthRangef(near_depth, far_depth);
  }
  
@@ -3552,16 +3573,6 @@ index ff5402b..766c83f 100644
 +});
 +#endif
 +
-+#ifdef __EMSCRIPTEN__
-+EM_JS(int, dolphin_debug_flag, (const char* name, int def), {
-+  var v = globalThis[UTF8ToString(name)];
-+  return v === undefined ? def : (v | 0);
-+});
-+int WebGLDebugFlag(const char* name, int def)
-+{
-+  return dolphin_debug_flag(name, def);
-+}
-+#endif
 +
 +void OGLGfx::BreakFeedbackLoops()
 +{
@@ -3616,7 +3627,7 @@ index ff5402b..766c83f 100644
    if (g_ogl_config.bSupportsGLBaseVertex)
    {
      glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
-@@ -450,6 +523,7 @@ void OGLGfx::Flush()
+@@ -450,6 +513,7 @@ void OGLGfx::Flush()
    // ensure all commands are sent to the GPU.
    // Otherwise the driver could batch several frames together.
    glFlush();
@@ -3624,7 +3635,7 @@ index ff5402b..766c83f 100644
  }
  
  void OGLGfx::WaitForGPUIdle()
-@@ -644,6 +718,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
+@@ -644,6 +708,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
    if (m_bound_textures[index] == gl_texture)
      return;
  
