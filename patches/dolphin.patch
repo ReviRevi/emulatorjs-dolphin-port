@@ -882,10 +882,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..206d14a
+index 0000000..227a48f
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2833 @@
+@@ -0,0 +1,2927 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -925,6 +925,7 @@ index 0000000..206d14a
 +#include <fmt/ostream.h>
 +
 +#include "Common/Logging/Log.h"
++#include "Core/HW/GPFifo.h"
 +#include "Core/HW/Memmap.h"
 +#include "Core/PowerPC/ConditionRegister.h"
 +#include "Core/PowerPC/Gekko.h"
@@ -1030,6 +1031,12 @@ index 0000000..206d14a
 +constexpr u32 L_I64_COUNT = L_I64_END - L_X;
 +constexpr u32 L_F64_COUNT = L_F64_END - L_F0;
 +
++// Gather pipe overflow check after an inline write (GPFifoManager::FastCheckGatherPipe).
++static void WasmJitGatherCheck(u32 gpfifo, u32)
++{
++  reinterpret_cast<GPFifo::GPFifoManager*>(static_cast<uintptr_t>(gpfifo))->FastCheckGatherPipe();
++}
++
 +// Everything the inline code needs to know about the emulated machine. The
 +// addresses are fixed for the lifetime of the emulation (and blocks are
 +// thrown away with the JIT cache when they change).
@@ -1056,6 +1063,9 @@ index 0000000..206d14a
 +  u32 feature_flags;  // offsetof(feature_flags)
 +  u32 ps;           // offsetof(ps): paired singles, {u64 ps0, ps1} as double bits
 +  u32 fpscr;        // offsetof(fpscr)
++  u32 gp_ptr;       // offsetof(gather_pipe_ptr)
++  u32 gp_base;      // offsetof(gather_pipe_base_ptr)
++  u32 gpfifo;       // &GPFifoManager
 +  bool dr;          // the block runs with MSR.DR set (blocks are per MSR.DR/IR,
 +                    // and instructions that change the MSR end the block)
 +};
@@ -1678,6 +1688,51 @@ index 0000000..206d14a
 +    }
 +  }
 +
++  // ---- gather pipe ----
++  // Games feed the GPU by storing to 0xCC008000 (the write-gather pipe). Those
++  // stores aren't RAM, so they used to take the Interpreter path through
++  // MMU::WriteToHardware. Instead, when L_EA is in the gather pipe's page,
++  // write big-endian at ppcState.gather_pipe_ptr directly (what
++  // GPFifoManager::FastWrite* does) and let the pipe flush once it holds 32
++  // bytes. Usage: GatherPipeBegin(); <store at L_HOST>; GatherPipeEnd(bytes,
++  // depth of $done from inside the If).
++  void GatherPipeBegin()
++  {
++    c.LocalGet(L_EA);
++    c.I32ConstU(0xFFFFF000);
++    c.I32And();
++    c.I32ConstU(m.dr ? 0xCC008000 : 0x0C008000);
++    c.I32Eq();
++    c.If();
++    c.I32ConstU(m.ppc);
++    c.I32Load(m.gp_ptr);
++    c.LocalSet(L_HOST);
++  }
++  void GatherPipeEnd(u32 bytes, u32 done_depth)
++  {
++    c.LocalGet(L_HOST);
++    c.I32Const(static_cast<s32>(bytes));
++    c.I32Add();
++    c.LocalSet(L_HOST);
++    c.I32ConstU(m.ppc);
++    c.LocalGet(L_HOST);
++    c.I32Store(m.gp_ptr);
++    c.LocalGet(L_HOST);
++    c.I32ConstU(m.ppc);
++    c.I32Load(m.gp_base);
++    c.I32Sub();
++    c.I32ConstU(GPFifo::GATHER_PIPE_SIZE);
++    c.I32GeU();
++    c.If();
++    c.I32ConstU(m.gpfifo);
++    c.I32Const(0);
++    c.I32ConstU(static_cast<u32>(reinterpret_cast<uintptr_t>(&WasmJitGatherCheck)));
++    c.CallIndirect(WasmJit::TYPE_V_II);
++    c.End();
++    c.Br(done_depth);
++    c.End();
++  }
++
 +  // Loads `size` bytes big-endian from L_HOST onto the stack.
 +  void LoadHost(u32 size, bool sign)
 +  {
@@ -1935,6 +1990,36 @@ index 0000000..206d14a
 +        e.ConvertToSingle(L_X, true, 0);
 +        c.LocalSet(L_V2);
 +      }
++    }
++    if (store && !update)
++    {
++      e.GatherPipeBegin();
++      u32 bytes = 4;
++      switch (kind)
++      {
++      case Mem::STFD:
++        c.LocalGet(L_HOST);
++        c.LocalGet(L_X);
++        e.Bswap64();
++        c.I64Store();
++        bytes = 8;
++        break;
++      case Mem::PSQ_ST:
++        e.StoreHost(4, L_V);
++        if (!w)
++        {
++          c.LocalGet(L_HOST);
++          c.LocalGet(L_V2);
++          e.Bswap32();
++          c.I32Store(4);
++          bytes = 8;
++        }
++        break;
++      default:  // STFS, STFIWX
++        e.StoreHost(4, L_V);
++        break;
++      }
++      e.GatherPipeEnd(bytes, 2);  // If -> $slow -> $done
 +    }
 +    e.Translate(size, store, 0);
 +    switch (kind)
@@ -2635,6 +2720,12 @@ index 0000000..206d14a
 +      c.LocalSet(Local::L_V);
 +    }
 +    const u32 loaded0 = e.loaded, dirty0 = e.dirty;
++    if (store && !update)
++    {
++      e.GatherPipeBegin();
++      e.StoreHost(size, Local::L_V);
++      e.GatherPipeEnd(size, 2);  // If -> $slow -> $done
++    }
 +    e.Translate(size, store, 0);
 +    if (store)
 +    {
@@ -3438,6 +3529,9 @@ index 0000000..206d14a
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, feature_flags)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, ps)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, fpscr)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_ptr)),
++      static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_base_ptr)),
++      static_cast<u32>(reinterpret_cast<uintptr_t>(&m_system.GetGPFifo())),
 +      (block.feature_flags & FEATURE_FLAG_MSR_DR) != 0,
 +  };
 +  const bool branch_watch = m_system.GetPowerPC().GetBranchWatch().GetRecordingActive();

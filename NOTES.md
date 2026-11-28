@@ -345,6 +345,19 @@ WebGPU and copies each finished frame into RetroArch's GL framebuffer.
   D24S8 depth can't be read back or sampled; ~7 draws per render pass on the menu (uploads and
   copies end passes).
 
+### Gather pipe stores in the JIT
+
+Baseball trace on the WebGPU build (2026-11-28): main thread ~96% busy; ~71% CPU emulation
+(37.5% compiled PowerPC code, 15.4% Interpreter fallbacks, 12.3% the CachedInterpreter dispatch
+loop), ~22% GPU side (10.8% WebGPU JS calls). The fallbacks were mostly `stw`/`stb` (and FP
+stores) to 0xCC008000: games feed the GPU by storing to the write-gather pipe, which isn't RAM, so
+those stores took the Interpreter -> MMU::WriteToHardware -> GPFifo path. Compiled stores now
+check for the gather pipe page first (EA 0xCC008000 with MSR.DR, 0x0C008000 without; non-update
+forms): the value is written big-endian at `ppcState.gather_pipe_ptr` (what GPFifoManager::FastWrite*
+does), and `FastCheckGatherPipe` is called once the pipe holds 32 bytes. Covers stb/sth/stw(x),
+stfs/stfd/stfiwx and float psq_st (quantized psq_st still falls back). fpbench checksum unchanged.
+`relink.sh` now links with `--profiling-funcs` so browser traces show function names.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
