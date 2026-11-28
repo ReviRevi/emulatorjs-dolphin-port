@@ -16,6 +16,7 @@ while ((await fn()) < 200) await p.waitForTimeout(500);
 const f0 = await fn(); await p.evaluate(() => __glcOn(true)); await p.waitForTimeout(10000); await p.evaluate(() => __glcOn(false)); const f1 = await fn();
 const c = await p.evaluate(() => __glc); const n = f1 - f0;
 const s = await p.evaluate(() => window.EJS_emulator.Module.dolphinGLStats());
+console.log('batch', JSON.stringify(await p.evaluate(() => { const c = document.querySelector('canvas'); const g = c && (c.getContext('webgl2')); return g && g.__dolphinBatchStats; })));
 console.log('frames', n, 'total calls/frame', (Object.values(c).reduce((a, b) => a + b, 0) / n).toFixed(1));
 for (const [k, v] of Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, 25)) console.log((v / n).toFixed(1).padStart(7), k);
 await b.close();

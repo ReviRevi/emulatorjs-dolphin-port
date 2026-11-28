@@ -270,6 +270,28 @@ change anything (ELEMENT_ARRAY_BUFFER tracked per VAO; deletes reset the cache):
 per frame, identical picture. The constants upload now does at most one bufferSubData per dirty
 section (first to last changed vec4).
 
+### Draw batching (DOLPHIN_GL_BATCH)
+
+WebGL2 has no base-vertex draws, so the BufferSubData stream buffer rewrites offset 0 of the
+vertex and index buffers before every draw: 2 uploads per draw. The call filter
+(`dolphin_webgl_install_call_filter` in Common/GL/GLUtil.cpp, now a wrapper over every GLctx
+method) can record instead: after each draw (`WebGLBatchBegin` in OGLGfx::Draw/DrawIndexed) the
+following calls are queued. Stream-buffer uploads go into JS staging arrays; each draw is
+rewritten to its staged data (indices rebased on the CPU by vertex offset / VAO stride and widened
+to u32; primitive restart 0xFFFF -> 0xFFFFFFFF). A flush uploads the staged vertices and indices in
+one bufferSubData each, then replays the queue. Any call not on the record list (getParameter
+except binding queries, which are answered from tracked state; texture uploads; deletes;
+readbacks) flushes first, and GLContextLR::Swap and the end of retro_run always flush. Draws that
+reuse data uploaded before the run (second passes) re-stage a JS copy of the last upload.
+Menu FIFO: 374 -> 244 calls per frame, ~10 draws per flush, no draws falling back.
+`gl.__dolphinBatchStats` (on the WebGL2 context) counts flushes, recorded draws and what forced
+flushes. The same layer now also drops redundant enable/disable, blend/depth/scissor/viewport,
+useProgram, bindTexture/bindSampler and uniform-buffer range rebinds. `DOLPHIN_GL_BATCH=0` /
+`DOLPHIN_GL_FILTER=0` turn the parts off.
+
+Remaining per-draw calls: one constants upload (bufferSubData) per changed section, texture binds,
+blend state. Versioning the constants buffer would only trade bufferSubData for bindBufferRange.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.

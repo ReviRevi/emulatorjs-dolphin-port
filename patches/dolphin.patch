@@ -53,10 +53,10 @@ index 66a074a..595001e 100644
    target_sources(common PRIVATE
      Logging/ConsoleListenerDroid.cpp
 diff --git a/Source/Core/Common/GL/GLUtil.cpp b/Source/Core/Common/GL/GLUtil.cpp
-index f447d55..27fe8b7 100644
+index f447d55..6aff644 100644
 --- a/Source/Core/Common/GL/GLUtil.cpp
 +++ b/Source/Core/Common/GL/GLUtil.cpp
-@@ -115,3 +115,29 @@ void EnablePrimitiveRestart(const GLContext* context)
+@@ -115,3 +115,305 @@ void EnablePrimitiveRestart(const GLContext* context)
    }
  }
  }  // namespace GLUtil
@@ -85,12 +85,288 @@ index f447d55..27fe8b7 100644
 +{
 +  dolphin_trace_line(line);
 +}
++// WebGL call filter, installed on the context object so every caller (Dolphin
++// and the RetroArch frontend) goes through it. In Chrome each WebGL call costs a
++// fixed amount in the GPU process, regardless of size, so fewer calls is what
++// matters.
++//  - dedup: state calls that set what's already set are dropped (binds, enable/
++//    disable, blend/depth/scissor/viewport state). Element-array bindings are
++//    tracked per VAO; deleting an object forgets the bindings that used it.
++//  - batch: after a draw, following calls are recorded instead of executed.
++//    Vertex and index uploads to Dolphin's stream buffers are appended to JS
++//    staging arrays; each draw is rewritten to point at its data there (WebGL
++//    has no base-vertex draws, so indices are rebased on the CPU and widened to
++//    32 bits). On flush the staged data goes up in one bufferSubData each and the
++//    recorded calls are replayed in order. Any call not on the record list
++//    (queries, texture uploads, deletes, readbacks ...) flushes first, so
++//    ordering is preserved.
++EM_JS(void, dolphin_webgl_install_call_filter, (int dedup, int batch), {
++  if (!GLctx || GLctx.__dolphinFilter) return;
++  var gl = GLctx;
++  gl.__dolphinFilter = true;
++  var ARRAY = 0x8892, ELEMENT = 0x8893, USHORT = 0x1403, UINT = 0x1405;
++  var raw = {}, names = [];
++  for (var p = gl; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
++    Object.getOwnPropertyNames(p).forEach(function(k) {
++      if (k === 'constructor' || k in raw) return;
++      var d = Object.getOwnPropertyDescriptor(p, k);
++      if (!d || typeof d.value !== 'function') return;
++      raw[k] = d.value.bind(gl);
++      names.push(k);
++    });
++  }
++  // ---- executed-state layer (tracking + dedup) ----
++  var ex = {};
++  names.forEach(function(k) { ex[k] = raw[k]; });
++  var bound = {}, vao = null, elem = new Map(), unit = -1, st = {}, tex = new Map(), smp = new Map(),
++      prog, strides = new Map();
++  ex.bindBuffer = function(t, b) {
++    b = b || null;
++    if (t === ELEMENT) { if (dedup && elem.has(vao) && elem.get(vao) === b) return; elem.set(vao, b); }
++    else { if (dedup && (t in bound) && bound[t] === b) return; bound[t] = b; }
++    raw.bindBuffer(t, b);
++  };
++  // Indexed bindings (uniform buffer ranges): a rebind of the same range is
++  // dropped; the generic binding it would also set is set with bindBuffer.
++  var ranges = new Map();
++  function rangeSame(t, i, b, o, s) {
++    var k = t * 64 + i, r = ranges.get(k);
++    if (dedup && r && r[0] === b && r[1] === o && r[2] === s) {
++      if (bound[t] !== b) { bound[t] = b; raw.bindBuffer(t, b); }
++      return true;
++    }
++    ranges.set(k, [b, o, s]); bound[t] = b;
++    return false;
++  }
++  ex.bindBufferRange = function(t, i, b, o, s) { b = b || null; if (!rangeSame(t, i, b, o, s)) raw.bindBufferRange(t, i, b, o, s); };
++  ex.bindBufferBase = function(t, i, b) { b = b || null; if (!rangeSame(t, i, b, -1, -1)) raw.bindBufferBase(t, i, b); };
++  ex.bindVertexArray = function(v) { v = v || null; if (dedup && v === vao) return; vao = v; raw.bindVertexArray(v); };
++  // Vertex stride per VAO (needed to rebase indices): the common stride of the
++  // enabled attributes, 0 if none, -1 if they differ. Stride 0 in a pointer call
++  // means tightly packed.
++  var attrs = new Map();
++  function attrOf(i) { if (!attrs.has(vao)) attrs.set(vao, new Map()); var m = attrs.get(vao); if (!m.has(i)) m.set(i, { s: 0, en: false }); return m.get(i); }
++  function restride() {
++    var m = attrs.get(vao), r = 0;
++    if (m) m.forEach(function(a) { if (a.en) r = (r === 0 || r === a.s) ? a.s : -1; });
++    strides.set(vao, r);
++  }
++  function tsize(t) { return (t === 0x1400 || t === 0x1401) ? 1 : (t === 0x1402 || t === 0x1403 || t === 0x140B) ? 2 : 4; }
++  ex.vertexAttribPointer = function(i, n, t, nm, s, o) { attrOf(i).s = s || n * tsize(t); restride(); raw.vertexAttribPointer(i, n, t, nm, s, o); };
++  ex.vertexAttribIPointer = function(i, n, t, s, o) { attrOf(i).s = s || n * tsize(t); restride(); raw.vertexAttribIPointer(i, n, t, s, o); };
++  ex.enableVertexAttribArray = function(i) { attrOf(i).en = true; restride(); raw.enableVertexAttribArray(i); };
++  ex.disableVertexAttribArray = function(i) { attrOf(i).en = false; restride(); raw.disableVertexAttribArray(i); };
++  ex.createVertexArray = function() { var v = raw.createVertexArray(); elem.set(v, null); strides.set(v, 0); return v; };
++  function dropValue2(m, o) { m.forEach(function(v, k) { if (v[0] === o) m.delete(k); }); }
++  function dropValue(m, o) { m.forEach(function(v, k) { if (v === o) m.delete(k); }); }
++  ex.deleteBuffer = function(o) {
++    dropValue2(ranges, o);
++    for (var t in bound) if (bound[t] === o) bound[t] = null;
++    elem.forEach(function(v, k) { if (v === o) { if (k === vao) elem.set(k, null); else elem.delete(k); } });
++    raw.deleteBuffer(o);
++  };
++  ex.deleteTexture = function(o) { dropValue(tex, o); raw.deleteTexture(o); };
++  ex.deleteSampler = function(o) { dropValue(smp, o); raw.deleteSampler(o); };
++  ex.deleteProgram = function(o) { if (o === prog) prog = undefined; raw.deleteProgram(o); };
++  ex.deleteVertexArray = function(v) { elem.delete(v); strides.delete(v); attrs.delete(v); if (v === vao) vao = null; raw.deleteVertexArray(v); };
++  ex.activeTexture = function(u) { if (dedup && u === unit) return; unit = u; raw.activeTexture(u); };
++  ex.bindTexture = function(t, o) {
++    o = o || null;
++    if (unit < 0) return raw.bindTexture(t, o);
++    var k = unit * 65536 + t;
++    if (dedup && tex.has(k) && tex.get(k) === o) return;
++    tex.set(k, o); raw.bindTexture(t, o);
++  };
++  ex.bindSampler = function(u, o) { o = o || null; if (dedup && smp.has(u) && smp.get(u) === o) return; smp.set(u, o); raw.bindSampler(u, o); };
++  ex.useProgram = function(o) { o = o || null; if (dedup && o === prog) return; prog = o; raw.useProgram(o); };
++  ex.enable = function(c) { var k = 'e' + c; if (dedup && st[k] === 1) return; st[k] = 1; raw.enable(c); };
++  ex.disable = function(c) { var k = 'e' + c; if (dedup && st[k] === 0) return; st[k] = 0; raw.disable(c); };
++  ['colorMask', 'blendEquationSeparate', 'blendFuncSeparate', 'blendColor', 'depthFunc', 'depthMask', 'depthRange',
++   'scissor', 'viewport', 'cullFace', 'frontFace', 'polygonOffset', 'clearColor', 'clearDepth', 'clearStencil'].forEach(function(k) {
++    var f = raw[k];
++    ex[k] = function() {
++      var v = Array.prototype.join.call(arguments, ',');
++      if (dedup && st[k] === v) return;
++      st[k] = v; f.apply(null, arguments);
++    };
++  });
++  ex.blendEquation = function(m) { delete st.blendEquationSeparate; raw.blendEquation(m); };
++  ex.blendFunc = function(a, b) { delete st.blendFuncSeparate; raw.blendFunc(a, b); };
++
++  if (!batch) {
++    names.forEach(function(k) { if (ex[k] !== raw[k]) gl[k] = ex[k]; });
++    return;
++  }
++
++  // ---- recording layer ----
++  var REC = ['bindBufferRange', 'bindBufferBase', 'useProgram', 'bindTexture', 'activeTexture', 'bindSampler',
++             'enable', 'disable', 'colorMask', 'blendEquationSeparate', 'blendFuncSeparate', 'blendEquation', 'blendFunc',
++             'blendColor', 'depthFunc', 'depthMask', 'depthRange', 'scissor', 'viewport', 'cullFace', 'frontFace',
++             'polygonOffset', 'stencilFunc', 'stencilOp', 'stencilMask', 'stencilFuncSeparate', 'stencilOpSeparate',
++             'stencilMaskSeparate', 'clear', 'clearColor', 'clearDepth', 'clearStencil', 'bindFramebuffer'];
++  var VCAP = 16 << 20, ICAP = (8 << 20) / 4 - 300000, MAXDRAWS = 4096;
++  var rec = false, cmds = [], vbo = null, ibo = null;
++  var vtx = new Uint8Array(1 << 20), vtxLen = 0, idx = new Uint32Array(1 << 18), idxLen = 0;
++  var misc = new Uint8Array(1 << 18), miscLen = 0;
++  var pend = -1, pendLen = 0, base = -1, lastIdx = null, lastVtx = null, nDraws = 0;
++  var lvao = null, larray = null, lelem = new Map();
++  var stats = gl.__dolphinBatchStats = { flushes: 0, recorded: 0, immediate: 0, uploads: 0, by: {} };
++
++  function reset() { vtxLen = idxLen = miscLen = 0; pend = -1; base = -1; nDraws = 0; lelem.clear(); }
++  function grow(a, n) { var c = a.length; while (c < n) c *= 2; var b = new a.constructor(c); b.set(a); return b; }
++  function bytesOf(src, so, len) {
++    if (so === undefined) return new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
++    var e = src.BYTES_PER_ELEMENT || 1;
++    if (len === undefined) len = src.length - so;
++    return new Uint8Array(src.buffer, src.byteOffset + so * e, len * e);
++  }
++  function flush() {
++    rec = false;
++    if (!cmds.length) { reset(); return; }
++    var c = cmds; cmds = [];
++    stats.flushes++;
++    if (idxLen || vtxLen) {
++      var pv = vao, pa = (ARRAY in bound) ? bound[ARRAY] : null;
++      if (idxLen) { ex.bindVertexArray(null); ex.bindBuffer(ELEMENT, ibo); raw.bufferSubData(ELEMENT, 0, idx, 0, idxLen); stats.uploads++; }
++      if (vtxLen) { ex.bindBuffer(ARRAY, vbo); raw.bufferSubData(ARRAY, 0, vtx, 0, vtxLen); stats.uploads++; }
++      ex.bindBuffer(ARRAY, pa); ex.bindVertexArray(pv);
++    }
++    for (var i = 0; i < c.length; i += 2) c[i].apply(null, c[i + 1]);
++    reset();
++  }
++  function lelemOf(v) { return lelem.has(v) ? lelem.get(v) : (elem.has(v) ? elem.get(v) : undefined); }
++  // Vertex base for the next recorded draw, or -1 if it can't be recorded.
++  function drawBase() {
++    var s = strides.has(lvao) ? strides.get(lvao) : 0;
++    if (s < 0) return -1;
++    if (pend >= 0) {
++      if (s === 0) { pend = -1; return (base = 0); }
++      var at = Math.ceil(pend / s) * s;
++      if (at !== pend) { if (at + pendLen > vtx.length) vtx = grow(vtx, at + pendLen); vtx.copyWithin(at, pend, pend + pendLen); vtxLen = at + pendLen; }
++      pend = -1;
++      return (base = at / s);
++    }
++    if (s === 0) return 0;
++    if (base < 0 && lastVtx) {
++      // Same data drawn again (e.g. a second pass) after it was uploaded outside
++      // this run: stage it again.
++      if (vtxLen + lastVtx.length + 64 > VCAP) return -1;
++      var at2 = (vtxLen + 3) & ~3;
++      if (at2 + lastVtx.length > vtx.length) vtx = grow(vtx, at2 + lastVtx.length);
++      vtx.set(lastVtx, at2); pend = at2; pendLen = lastVtx.length; vtxLen = at2 + lastVtx.length;
++      return drawBase();
++    }
++    return base;
++  }
++  names.forEach(function(k) {
++    var e = ex[k];
++    if (REC.indexOf(k) >= 0) {
++      gl[k] = function() {
++        if (!rec) return e.apply(null, arguments);
++        if ((k === 'bindBufferRange' || k === 'bindBufferBase') && arguments[0] === ARRAY) larray = arguments[2] || null;
++        cmds.push(e, Array.prototype.slice.call(arguments));
++      };
++    } else {
++      gl[k] = function() { if (rec) { if (cmds.length) { var kk = k === 'getParameter' ? 'gp' + arguments[0] : k; stats.by[kk] = (stats.by[kk] || 0) + 1; } flush(); } return e.apply(null, arguments); };
++    }
++  });
++  gl.bindVertexArray = function(v) {
++    if (!rec) return ex.bindVertexArray(v);
++    lvao = v || null; cmds.push(ex.bindVertexArray, [lvao]);
++  };
++  gl.bindBuffer = function(t, b) {
++    if (!rec) return ex.bindBuffer(t, b);
++    b = b || null;
++    if (t === ELEMENT) lelem.set(lvao, b); else if (t === ARRAY) larray = b;
++    cmds.push(ex.bindBuffer, [t, b]);
++  };
++  gl.bufferSubData = function(t, off, src, so, len) {
++    if (!rec) {
++      if (off === 0 && vbo && t === ARRAY && bound[ARRAY] === vbo) { lastVtx = bytesOf(src, so, len).slice(); base = -1; }
++      else if (off === 0 && ibo && t === ELEMENT && elem.get(vao) === ibo) { var bb = bytesOf(src, so, len); lastIdx = new Uint16Array(bb.slice(0, bb.length & ~1).buffer); }
++      return raw.bufferSubData.apply(null, arguments);
++    }
++    var by = bytesOf(src, so, len);
++    if (off === 0 && vbo && t === ARRAY && larray === vbo) {
++      if (vtxLen + by.length + 64 > VCAP || idxLen > ICAP || nDraws >= MAXDRAWS) { flush(); return raw.bufferSubData.apply(null, arguments); }
++      var at = (vtxLen + 3) & ~3;
++      if (at + by.length > vtx.length) vtx = grow(vtx, at + by.length);
++      vtx.set(by, at); pend = at; pendLen = by.length; vtxLen = at + by.length;
++      lastVtx = by.slice();
++      return;
++    }
++    if (off === 0 && ibo && t === ELEMENT && lelemOf(lvao) === ibo && !(by.length & 1)) {
++      if (idxLen > ICAP || nDraws >= MAXDRAWS) { flush(); return raw.bufferSubData.apply(null, arguments); }
++      lastIdx = new Uint16Array(by.slice().buffer);
++      return;
++    }
++    var at2 = (miscLen + 15) & ~15;
++    if (at2 + by.length > misc.length) misc = grow(misc, at2 + by.length);
++    misc.set(by, at2); miscLen = at2 + by.length;
++    cmds.push(raw.bufferSubData, [t, off, misc.subarray(at2, at2 + by.length)]);
++  };
++  gl.drawElements = function(m, n, type, off) {
++    if (!rec) return ex.drawElements(m, n, type, off);
++    var b = (type === USHORT && lastIdx && !(off & 1)) ? drawBase() : -1;
++    if (b < 0 || (off >> 1) + n > lastIdx.length) { var why = type !== USHORT ? 'type' : !lastIdx ? 'noidx' : (off & 1) ? 'odd' : b < 0 ? ('base' + (strides.has(lvao) ? strides.get(lvao) : 'none') + (pend >= 0 ? 'p' : '')) : 'len'; stats.by[why] = (stats.by[why] || 0) + 1; flush(); stats.immediate++; return raw.drawElements(m, n, type, off); }
++    if (idxLen + n > idx.length) idx = grow(idx, idxLen + n);
++    var s = off >> 1, o = idxLen;
++    for (var i = 0; i < n; i++) { var v = lastIdx[s + i]; idx[o + i] = v === 0xFFFF ? 0xFFFFFFFF : v + b; }
++    idxLen += n; nDraws++; stats.recorded++;
++    cmds.push(raw.drawElements, [m, n, UINT, o * 4]);
++  };
++  gl.drawArrays = function(m, first, n) {
++    if (!rec) return ex.drawArrays(m, first, n);
++    var b = drawBase();
++    if (b < 0) { stats.by.arr = (stats.by.arr || 0) + 1; flush(); stats.immediate++; return raw.drawArrays(m, first, n); }
++    nDraws++; stats.recorded++;
++    cmds.push(raw.drawArrays, [m, first + b, n]);
++  };
++  var getParameter = gl.getParameter;
++  gl.getParameter = function(pn) {
++    if (pn === 0x8895) { var e2 = rec ? lelemOf(lvao) : (elem.has(vao) ? elem.get(vao) : undefined); if (e2 !== undefined) return e2; }
++    else if (pn === 0x8894) { var a2 = rec ? larray : bound[ARRAY]; if (a2 !== undefined) return a2; }
++    else if (pn === 0x85B5) return rec ? lvao : vao;
++    return getParameter.apply(null, arguments);
++  };
++  gl.__dolphinBatchBegin = function() {
++    if (rec) return;
++    rec = true; lvao = vao; larray = (ARRAY in bound) ? bound[ARRAY] : null; lelem.clear();
++  };
++  gl.__dolphinBatchFlush = flush;
++  gl.__dolphinSetStream = function(v, i) { vbo = v || null; ibo = i || null; };
++});
++EM_JS(void, dolphin_webgl_batch_begin, (), { if (GLctx && GLctx.__dolphinBatchBegin) GLctx.__dolphinBatchBegin(); });
++EM_JS(void, dolphin_webgl_batch_flush, (), { if (GLctx && GLctx.__dolphinBatchFlush) GLctx.__dolphinBatchFlush(); });
++EM_JS(void, dolphin_webgl_set_stream, (unsigned v, unsigned i), {
++  if (GLctx && GLctx.__dolphinSetStream) GLctx.__dolphinSetStream(GL.buffers[v], GL.buffers[i]);
++});
++static bool s_webgl_batch = false;
++void WebGLInstallCallFilter(bool dedup, bool batch)
++{
++  s_webgl_batch = batch;
++  dolphin_webgl_install_call_filter(dedup, batch);
++}
++void WebGLSetStreamBuffers(GLuint vertex_buffer, GLuint index_buffer)
++{
++  dolphin_webgl_set_stream(vertex_buffer, index_buffer);
++}
++void WebGLBatchBegin()
++{
++  if (s_webgl_batch)
++    dolphin_webgl_batch_begin();
++}
++void WebGLBatchFlush()
++{
++  if (s_webgl_batch)
++    dolphin_webgl_batch_flush();
++}
 +#endif
 diff --git a/Source/Core/Common/GL/GLUtil.h b/Source/Core/Common/GL/GLUtil.h
-index a2225ec..741d59b 100644
+index a2225ec..1b0da44 100644
 --- a/Source/Core/Common/GL/GLUtil.h
 +++ b/Source/Core/Common/GL/GLUtil.h
-@@ -12,6 +12,41 @@ class GLContext;
+@@ -12,6 +12,48 @@ class GLContext;
  // Texture which we use to not disturb the other bindings.
  constexpr GLenum GL_MUTABLE_TEXTURE_INDEX = GL_TEXTURE10;
  
@@ -124,6 +400,13 @@ index a2225ec..741d59b 100644
 +bool WebGLTraceActive();
 +void WebGLTrace(const char* line);
 +inline WebGLStats g_webgl_stats{};
++// JS-side WebGL call filter (see GLUtil.cpp): `dedup` drops state calls that
++// change nothing; `batch` records runs of draws and uploads their vertex and
++// index data in one call each before replaying them.
++void WebGLInstallCallFilter(bool dedup, bool batch);
++void WebGLSetStreamBuffers(GLuint vertex_buffer, GLuint index_buffer);
++void WebGLBatchBegin();   // after a draw: start recording the following calls
++void WebGLBatchFlush();   // before the frontend uses the picture
 +#define WEBGL_STAT(field, n) (g_webgl_stats.field += (n))
 +#else
 +#define WEBGL_STAT(field, n) ((void)0)
@@ -3855,11 +4138,40 @@ index 159e6a6..361c500 100644
    Audio.cpp
    Boot.cpp
    Host.cpp
+diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
+index 97ba667..c11221d 100644
+--- a/Source/Core/DolphinLibretro/Main.cpp
++++ b/Source/Core/DolphinLibretro/Main.cpp
+@@ -1,4 +1,5 @@
+ 
++#include "Common/GL/GLUtil.h"
+ #include <cmath>
+ #include <cstdint>
+ #include <libretro.h>
+@@ -244,6 +245,13 @@ void retro_reset(void)
+ 
+ void retro_run(void)
+ {
++#ifdef __EMSCRIPTEN__
++  // Never leave recorded WebGL calls pending when control returns to the frontend.
++  struct BatchFlushAtExit
++  {
++    ~BatchFlushAtExit() { WebGLBatchFlush(); }
++  } batch_flush_at_exit;
++#endif
+   Libretro::Input::InitSensors();
+   Libretro::Options::CheckForUpdatedVariables();
+   Libretro::FrameTiming::CheckForFastForwarding();
 diff --git a/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp b/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
-index a3f108e..73f84ff 100644
+index a3f108e..580c156 100644
 --- a/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
 +++ b/Source/Core/DolphinLibretro/VideoContexts/GLContextLR.cpp
-@@ -22,6 +22,10 @@
+@@ -1,3 +1,4 @@
++#include "Common/GL/GLUtil.h"
+ #include "GLContextLR.h"
+ #include "Common/Logging/Log.h"
+ #include "Core/Config/MainSettings.h"
+@@ -22,6 +23,10 @@
  #include "Common/DynamicLibrary.h"
  #endif
  
@@ -3870,7 +4182,7 @@ index a3f108e..73f84ff 100644
  namespace
  {
  // Version/profile of the frontend context, so worker contexts are created to match it.
-@@ -312,6 +316,13 @@ GLContextLR::~GLContextLR() = default;
+@@ -312,6 +317,13 @@ GLContextLR::~GLContextLR() = default;
  
  void* GLContextLR::GetFuncAddress(const std::string& name)
  {
@@ -3884,8 +4196,18 @@ index a3f108e..73f84ff 100644
    return (void*)Libretro::Video::hw_render.get_proc_address(name.c_str());
  }
  
+@@ -347,6 +359,9 @@ bool GLContextLR::Initialize(const WindowSystemInfo& wsi, bool stereo, bool core
+ 
+ void GLContextLR::Swap()
+ {
++#ifdef __EMSCRIPTEN__
++  WebGLBatchFlush();  // recorded WebGL calls must run before the frontend draws the frame
++#endif
+   Libretro::Video::video_cb(VideoCommon::g_is_duplicate_frame ? nullptr : RETRO_HW_FRAME_BUFFER_VALID,
+         m_backbuffer_width, m_backbuffer_height, 0);
+ }
 diff --git a/Source/Core/VideoBackends/OGL/OGLConfig.cpp b/Source/Core/VideoBackends/OGL/OGLConfig.cpp
-index e20bf10..145919d 100644
+index e20bf10..79e3036 100644
 --- a/Source/Core/VideoBackends/OGL/OGLConfig.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLConfig.cpp
 @@ -12,6 +12,7 @@
@@ -3896,50 +4218,12 @@ index e20bf10..145919d 100644
  #include "Common/GL/GLExtensions/GLExtensions.h"
  #include "Common/MsgHandler.h"
  
-@@ -26,6 +27,75 @@
+@@ -26,6 +27,37 @@
  #include "DolphinLibretro/Common/Options.h"
  #endif
  
 +#ifdef __EMSCRIPTEN__
 +#include <emscripten.h>
-+// Drop WebGL calls that don't change anything (re-binding the bound buffer,
-+// re-selecting the active texture unit) before they reach Chrome's GPU
-+// process, where each call has a fixed cost. Bindings that are VAO state
-+// (ELEMENT_ARRAY_BUFFER) are tracked per VAO; anything unusual (deletes,
-+// unknown targets) just invalidates the cache.
-+EM_JS(void, dolphin_webgl_install_call_filter, (), {
-+  if (!GLctx || GLctx.__dolphinFilter) return;
-+  var gl = GLctx;
-+  gl.__dolphinFilter = true;
-+  var ARRAY = 0x8892, ELEMENT = 0x8893, UNIFORM = 0x8A11;
-+  var bound = {};          // target -> buffer (global bindings)
-+  var vao = null;          // current vertex array object
-+  var elem = new Map();    // vao -> element array buffer
-+  var unit = -1;           // active texture unit
-+  var bindBuffer = gl.bindBuffer.bind(gl), bindBufferRange = gl.bindBufferRange.bind(gl),
-+      bindBufferBase = gl.bindBufferBase.bind(gl), bindVertexArray = gl.bindVertexArray.bind(gl),
-+      deleteBuffer = gl.deleteBuffer.bind(gl), deleteVertexArray = gl.deleteVertexArray.bind(gl),
-+      activeTexture = gl.activeTexture.bind(gl);
-+  gl.bindBuffer = function(t, b) {
-+    b = b || null;
-+    if (t === ELEMENT) {
-+      if (elem.has(vao) && elem.get(vao) === b) return;
-+      elem.set(vao, b);
-+    } else {
-+      if (t in bound && bound[t] === b) return;
-+      bound[t] = b;
-+    }
-+    bindBuffer(t, b);
-+  };
-+  // these also set the target's generic binding
-+  gl.bindBufferRange = function(t, i, b, o, s) { bound[t] = b || null; bindBufferRange(t, i, b, o, s); };
-+  gl.bindBufferBase = function(t, i, b) { bound[t] = b || null; bindBufferBase(t, i, b); };
-+  gl.bindVertexArray = function(v) { vao = v || null; bindVertexArray(v); };
-+  gl.deleteBuffer = function(b) { bound = {}; elem.clear(); deleteBuffer(b); };
-+  gl.deleteVertexArray = function(v) { elem.delete(v); if (v === vao) vao = null; deleteVertexArray(v); };
-+  gl.activeTexture = function(u) { if (u === unit) return; unit = u; activeTexture(u); };
-+});
-+
 +EM_JS(int, dolphin_webgl_enable_ext, (const char* name), {
 +  try {
 +    return GLctx && GLctx.getExtension(UTF8ToString(name)) ? 1 : 0;
@@ -3972,7 +4256,7 @@ index e20bf10..145919d 100644
  namespace OGL
  {
  void InitDriverInfo()
-@@ -287,6 +357,18 @@ bool PopulateConfig(GLContext* m_main_gl_context)
+@@ -287,6 +319,18 @@ bool PopulateConfig(GLContext* m_main_gl_context)
  
    g_backend_info.bSupportsDualSourceBlend = (GLExtensions::Supports("GL_ARB_blend_func_extended") ||
                                               GLExtensions::Supports("GL_EXT_blend_func_extended"));
@@ -3985,13 +4269,13 @@ index e20bf10..145919d 100644
 +      WebGLDebugFlag("DOLPHIN_GL_DUALSRC", 1) != 0 && dolphin_webgl_enable_dual_source() != 0;
 +  INFO_LOG_FMT(VIDEO, "WebGL dual-source blending: {}",
 +               g_backend_info.bSupportsDualSourceBlend ? "yes" : "no");
-+  if (WebGLDebugFlag("DOLPHIN_GL_FILTER", 1) != 0)
-+    dolphin_webgl_install_call_filter();
++  WebGLInstallCallFilter(WebGLDebugFlag("DOLPHIN_GL_FILTER", 1) != 0,
++                         WebGLDebugFlag("DOLPHIN_GL_BATCH", 1) != 0);
 +#endif
    g_backend_info.bSupportsPrimitiveRestart =
        !DriverDetails::HasBug(DriverDetails::BUG_PRIMITIVE_RESTART) &&
        ((GLExtensions::Version() >= 310) || GLExtensions::Supports("GL_NV_primitive_restart"));
-@@ -394,6 +476,20 @@ bool PopulateConfig(GLContext* m_main_gl_context)
+@@ -394,6 +438,20 @@ bool PopulateConfig(GLContext* m_main_gl_context)
      // TODO: Implement support for GL_EXT_clip_cull_distance when there is an extension for
      // depth clamping.
      g_backend_info.bSupportsDepthClamp = false;
@@ -4013,7 +4297,7 @@ index e20bf10..145919d 100644
      // GLES does not support logic op.
      g_backend_info.bSupportsLogicOp = false;
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-index ff5402b..bd38e4f 100644
+index ff5402b..91576a9 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 @@ -6,6 +6,9 @@
@@ -4042,7 +4326,7 @@ index ff5402b..bd38e4f 100644
      glEnable(GL_DEPTH_CLAMP);
    }
  
-@@ -271,14 +279,74 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+@@ -271,14 +279,77 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
    glDepthRangef(near_depth, far_depth);
  }
  
@@ -4106,6 +4390,9 @@ index ff5402b..bd38e4f 100644
 +#endif
    glDrawArrays(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(), base_vertex,
                 num_vertices);
++#ifdef __EMSCRIPTEN__
++  WebGLBatchBegin();
++#endif
  }
  
  void OGLGfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
@@ -4117,7 +4404,17 @@ index ff5402b..bd38e4f 100644
    if (g_ogl_config.bSupportsGLBaseVertex)
    {
      glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
-@@ -387,7 +455,10 @@ void OGLGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorEn
+@@ -290,6 +361,9 @@ void OGLGfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
+     glDrawElements(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
+                    num_indices, GL_UNSIGNED_SHORT, static_cast<u16*>(nullptr) + base_index);
+   }
++#ifdef __EMSCRIPTEN__
++  WebGLBatchBegin();
++#endif
+ }
+ 
+ void OGLGfx::DispatchComputeShader(const AbstractShader* shader, u32 groupsize_x, u32 groupsize_y,
+@@ -387,7 +461,10 @@ void OGLGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorEn
    if (zEnable)
    {
      glDepthMask(zEnable ? GL_TRUE : GL_FALSE);
@@ -4129,7 +4426,7 @@ index ff5402b..bd38e4f 100644
      clear_mask |= GL_DEPTH_BUFFER_BIT;
    }
  
-@@ -450,6 +521,7 @@ void OGLGfx::Flush()
+@@ -450,6 +527,7 @@ void OGLGfx::Flush()
    // ensure all commands are sent to the GPU.
    // Otherwise the driver could batch several frames together.
    glFlush();
@@ -4137,7 +4434,7 @@ index ff5402b..bd38e4f 100644
  }
  
  void OGLGfx::WaitForGPUIdle()
-@@ -487,7 +559,11 @@ void OGLGfx::CheckForSurfaceResize()
+@@ -487,7 +565,11 @@ void OGLGfx::CheckForSurfaceResize()
  void OGLGfx::BeginUtilityDrawing()
  {
    AbstractGfx::BeginUtilityDrawing();
@@ -4150,7 +4447,7 @@ index ff5402b..bd38e4f 100644
    {
      glDisable(GL_CLIP_DISTANCE0);
      glDisable(GL_CLIP_DISTANCE1);
-@@ -497,7 +573,11 @@ void OGLGfx::BeginUtilityDrawing()
+@@ -497,7 +579,11 @@ void OGLGfx::BeginUtilityDrawing()
  void OGLGfx::EndUtilityDrawing()
  {
    AbstractGfx::EndUtilityDrawing();
@@ -4163,7 +4460,7 @@ index ff5402b..bd38e4f 100644
    {
      glEnable(GL_CLIP_DISTANCE0);
      glEnable(GL_CLIP_DISTANCE1);
-@@ -529,8 +609,17 @@ void OGLGfx::ApplyDepthState(const DepthState state)
+@@ -529,8 +615,17 @@ void OGLGfx::ApplyDepthState(const DepthState state)
    if (m_current_depth_state == state)
      return;
  
@@ -4181,7 +4478,7 @@ index ff5402b..bd38e4f 100644
  
    if (state.test_enable)
    {
-@@ -644,6 +733,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
+@@ -644,6 +739,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
    if (m_bound_textures[index] == gl_texture)
      return;
  
@@ -4481,6 +4778,20 @@ index 003a7ec..4f65466 100644
  
    glBindBuffer(m_target, m_buffer_name);
    glUnmapBuffer(m_target);
+diff --git a/Source/Core/VideoBackends/OGL/OGLVertexManager.cpp b/Source/Core/VideoBackends/OGL/OGLVertexManager.cpp
+index c5382cf..bb8a9ab 100644
+--- a/Source/Core/VideoBackends/OGL/OGLVertexManager.cpp
++++ b/Source/Core/VideoBackends/OGL/OGLVertexManager.cpp
+@@ -55,6 +55,9 @@ bool VertexManager::Initialize()
+ 
+   m_vertex_buffer = StreamBuffer::Create(GL_ARRAY_BUFFER, VERTEX_STREAM_BUFFER_SIZE);
+   m_index_buffer = StreamBuffer::Create(GL_ELEMENT_ARRAY_BUFFER, INDEX_STREAM_BUFFER_SIZE);
++#ifdef __EMSCRIPTEN__
++  WebGLSetStreamBuffers(m_vertex_buffer->GetGLBufferId(), m_index_buffer->GetGLBufferId());
++#endif
+   if (g_ActiveConfig.UseVSForLinePointExpand() || g_backend_info.bSupportsDynamicVertexLoader)
+   {
+     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_vertex_buffer->GetGLBufferId());
 diff --git a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
 index 1dfd026..5075961 100644
 --- a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
