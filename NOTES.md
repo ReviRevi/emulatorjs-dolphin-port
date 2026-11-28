@@ -148,7 +148,7 @@ a screenshot.
 Bugs found this way: `psq_st` kept the second value in a local that address translation reused
 (wrong ps1 stored; likely the black screen after Start in Mario Superstar Baseball).
 
-Also inline: `lmw`/`stmw` (whole range in one page), `mfmsr`, CR logic ops (`crand`..`crxor`),
+Also inline: `stfiwx`, `subfze`, `fres`/`frsqrte`/`ps_res`/`ps_rsqrte` (table estimates through the function table; zero/NaN/inf/negative to the Interpreter), `lmw`/`stmw` (whole range in one page), `mfmsr`, CR logic ops (`crand`..`crxor`),
 `mcrf`, `mfcr`, `mtcrf`, `psq_lx`/`stx`/`lux`/`stux`, and double `fmadd`/`fmsub`/`fnmadd`/`fnmsub`
 (WebAssembly has no FMA, so these call `std::fma` through the function table; NaN results go to
 the Interpreter). `DOLPHIN_WASM_JIT_DISABLE` group 256 = CR ops.

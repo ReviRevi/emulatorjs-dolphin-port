@@ -591,10 +591,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..475cb38
+index 0000000..206d14a
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2749 @@
+@@ -0,0 +1,2833 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -623,6 +623,7 @@ index 0000000..475cb38
 +#include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
 +
 +#include <cmath>
++#include <limits>
 +#include <cstdio>
 +#include <cstddef>
 +#include <functional>
@@ -641,6 +642,7 @@ index 0000000..475cb38
 +#include "Core/Debugger/BranchWatch.h"
 +#include "Core/PowerPC/CachedInterpreter/WasmEmitter.h"
 +#include "Common/GL/GLUtil.h"
++#include "Common/FloatUtils.h"
 +#include "Core/PowerPC/Interpreter/Interpreter.h"
 +#include "Core/PowerPC/PPCTables.h"
 +#include "Core/PowerPC/PowerPC.h"
@@ -1477,6 +1479,16 @@ index 0000000..475cb38
 +  return std::fma(a, b, c);
 +}
 +
++// Common::ApproximateReciprocal(SquareRoot): table-based, called like WasmJitFma.
++static double WasmJitRecip(double b, double, double)
++{
++  return Common::ApproximateReciprocal(b);
++}
++static double WasmJitRsqrte(double b, double, double)
++{
++  return Common::ApproximateReciprocalSquareRoot(b);
++}
++
 +static bool EmitInlineFP(Emitter& e, UGeckoInstruction inst, bool& handled,
 +                         const std::function<void()>& fallback)
 +{
@@ -1562,11 +1574,12 @@ index 0000000..475cb38
 +  const u32 fd = inst.FD, fa = inst.FA, fb = inst.FB, fc = inst.FC;
 +
 +  // ---------------- loads / stores ----------------
-+  enum class Mem { LFS, LFD, STFS, STFD, PSQ_L, PSQ_ST };
++  enum class Mem { LFS, LFD, STFS, STFD, PSQ_L, PSQ_ST, STFIWX };
 +  auto fpmem = [&](Mem kind, auto ea, bool update, bool w = false, u32 gqr = 0) {
 +    if (!Enabled((kind == Mem::PSQ_L || kind == Mem::PSQ_ST) ? GROUP_PSQ : GROUP_FP_LOADSTORE))
 +      return false;
-+    const bool store = kind == Mem::STFS || kind == Mem::STFD || kind == Mem::PSQ_ST;
++    const bool store =
++        kind == Mem::STFS || kind == Mem::STFD || kind == Mem::PSQ_ST || kind == Mem::STFIWX;
 +    const u32 size = (kind == Mem::LFD || kind == Mem::STFD) ? 8 :
 +                     ((kind == Mem::PSQ_L || kind == Mem::PSQ_ST) && !w) ? 8 : 4;
 +    c.Block();  // $done
@@ -1611,6 +1624,12 @@ index 0000000..475cb38
 +    {
 +      e.PushPSBits(fd, 0);
 +      c.LocalSet(L_X);
++    }
++    else if (kind == Mem::STFIWX)  // low 32 bits of ps0, as is
++    {
++      e.PushPSBits(fd, 0);
++      c.I32WrapI64();
++      c.LocalSet(L_V);
 +    }
 +    else if (kind == Mem::PSQ_ST)
 +    {
@@ -1670,6 +1689,7 @@ index 0000000..475cb38
 +      e.StorePSBitsFromLocal(fd, 1, L_X2);
 +      break;
 +    case Mem::STFS:
++    case Mem::STFIWX:
 +      e.StoreHost(4, L_V);
 +      break;
 +    case Mem::STFD:
@@ -1748,6 +1768,7 @@ index 0000000..475cb38
 +    case 695: return fpmem(Mem::STFS, ea_xu, true);
 +    case 727: return fpmem(Mem::STFD, ea_x, false);
 +    case 759: return fpmem(Mem::STFD, ea_xu, true);
++    case 983: return fpmem(Mem::STFIWX, ea_x, false);
 +    default: handled = false; return false;
 +    }
 +  case 59:
@@ -1832,6 +1853,57 @@ index 0000000..475cb38
 +  };
 +  constexpr s64 SIGN = static_cast<s64>(0x8000000000000000ULL);
 +
++  // fres/frsqrte/ps_res/ps_rsqrte: Common::ApproximateReciprocal(SquareRoot) through
++  // the function table. Inputs that raise exceptions or clear FI/FR in the Interpreter
++  // (zero, NaN, infinity, and negative for rsqrte) go to the Interpreter.
++  auto estimate = [&](bool rsqrt, u32 halves, bool fill, bool force_single) {
++    return with_fallback(
++        [&] {
++          for (u32 h = 0; h < halves; h++)
++          {
++            const u32 in = h ? L_F1 : L_F0;
++            e.PushPS(fb, h);
++            c.LocalSet(in);
++            // rsqrt: 0 < b < inf; reciprocal: 0 < |b| < inf (false for NaN)
++            c.LocalGet(in);
++            if (!rsqrt)
++              c.F64Abs();
++            c.F64Const(0.0);
++            c.F64Gt();
++            c.LocalGet(in);
++            c.F64Abs();
++            c.F64Const(std::numeric_limits<double>::infinity());
++            c.F64Lt();
++            c.I32And();
++            c.I32Eqz();
++            c.BrIf(0);
++          }
++          for (u32 h = 0; h < halves; h++)
++          {
++            const u32 in = h ? L_F1 : L_F0;
++            const u32 out = h ? L_F3 : L_F2;
++            c.LocalGet(in);
++            c.F64Const(0.0);
++            c.F64Const(0.0);
++            c.I32ConstU(static_cast<u32>(
++                reinterpret_cast<uintptr_t>(rsqrt ? &WasmJitRsqrte : &WasmJitRecip)));
++            c.CallIndirect(WasmJit::TYPE_F_FFF);
++            c.LocalSet(out);
++            if (force_single)
++            {
++              e.ForceSingle(out);
++              c.LocalSet(out);
++            }
++          }
++          e.StorePSFromLocal(fd, 0, L_F2);
++          if (halves == 2)
++            e.StorePSFromLocal(fd, 1, L_F3);
++          else if (fill)
++            e.StorePSFromLocal(fd, 1, L_F2);
++        },
++        false);
++  };
++
 +  if (inst.OPCD == 59)
 +  {
 +    if (!Enabled(GROUP_FP_SINGLE))
@@ -1848,7 +1920,8 @@ index 0000000..475cb38
 +    case 29: op = Op::Madd; break;
 +    case 30: op = Op::Msub; neg = true; break;
 +    case 31: op = Op::Madd; neg = true; break;
-+    default: return false;  // fres
++    case 24: return estimate(false, 1, true, false);  // fres: ps0 = ps1 = 1/b
++    default: return false;
 +    }
 +    return with_fallback(
 +        [&] {
@@ -1919,6 +1992,8 @@ index 0000000..475cb38
 +          },
 +          false);
 +    }
++    case 26:  // frsqrte: ps0 only
++      return estimate(true, 1, false, false);
 +    case 23:  // fsel: ps0 = a >= -0.0 ? c : b
 +      e.PushPSBits(fc, 0);
 +      e.PushPSBits(fb, 0);
@@ -2045,6 +2120,14 @@ index 0000000..475cb38
 +  };
 +  switch (inst.SUBOP5)
 +  {
++  case 24:  // ps_res
++    if (!Enabled(GROUP_PS_ARITH))
++      return false;
++    return estimate(false, 2, false, false);
++  case 26:  // ps_rsqrte: ForceSingle of each estimate
++    if (!Enabled(GROUP_PS_ARITH))
++      return false;
++    return estimate(true, 2, false, true);
 +  case 10:  // ps_sum0: ps0 = a0 + b1, ps1 = c1
 +  case 11:  // ps_sum1: ps0 = c0, ps1 = a0 + b1
 +  {
@@ -2237,7 +2320,7 @@ index 0000000..475cb38
 +  }
 +
 +  if (inst.OPCD == 4 || inst.OPCD == 59 || inst.OPCD == 63 || (inst.OPCD >= 48 && inst.OPCD <= 61) ||
-+      (inst.OPCD == 31 && inst.SUBOP10 >= 535 && inst.SUBOP10 <= 759))
++      (inst.OPCD == 31 && ((inst.SUBOP10 >= 535 && inst.SUBOP10 <= 759) || inst.SUBOP10 == 983)))
 +  {
 +    bool handled;
 +    const bool ok = EmitInlineFP(e, inst, handled, fallback);
@@ -2947,19 +3030,20 @@ index 0000000..475cb38
 +  case 10:   // addc: CA = carry(a, b)
 +  case 138:  // adde: CA = carry(a, b) || carry(a + b, ca)
 +  case 202:  // addze: rD = a + ca, CA = carry(a, ca)
++  case 200:  // subfze: rD = ~a + ca, CA = carry(~a, ca)
 +  case 8:    // subfc: rD = ~a + b + 1, CA = ~a == 0xFFFFFFFF || carry(b, ~a + 1)
 +  case 136:  // subfe: rD = ~a + b + ca, CA = carry(~a, b) || carry(~a + b, ca)
 +  {
 +    const u32 op = xo & 0x1ff;
 +    // Do it in 64 bits: carry is bit 32 of the full sum.
 +    e.PushGPR(ra);
-+    if (op == 8 || op == 136)
++    if (op == 8 || op == 136 || op == 200)
 +    {
 +      c.I32Const(-1);
 +      c.I32Xor();
 +    }
 +    c.I64ExtendI32U();
-+    if (op != 202)
++    if (op != 202 && op != 200)
 +    {
 +      e.PushGPR(rb);
 +      c.I64ExtendI32U();
