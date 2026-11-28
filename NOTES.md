@@ -259,6 +259,17 @@ Dirty sections are then compared with a shadow copy of the buffer and only chang
 Baseball gameplay 41% -> ~60% speed, TTYD 34% -> 41% (sections only). `DOLPHIN_GL_UBO_PARTIAL=0`
 reverts.
 
+### WebGL call count
+
+Bytes uploaded don't matter much in Chrome's GPU process; the number of calls does (cutting
+constant uploads 3x in bytes didn't speed Baseball up). `scripts/glcalls.mjs` counts WebGL calls
+per frame by name while replaying a FIFO log. Menu: ~12.5 calls per draw, ~2.5 of them redundant
+`bindBuffer` and ~0.6 redundant `activeTexture`. A JS-side filter installed on GLctx at init
+(`dolphin_webgl_install_call_filter`, `DOLPHIN_GL_FILTER=0` to disable) drops binds that don't
+change anything (ELEMENT_ARRAY_BUFFER tracked per VAO; deletes reset the cache): 475 -> 374 calls
+per frame, identical picture. The constants upload now does at most one bufferSubData per dirty
+section (first to last changed vec4).
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
