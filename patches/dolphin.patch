@@ -598,6 +598,40 @@ index f0c62d4..158d4ac 100644
          break;
        }
      }
+diff --git a/Source/Core/Core/HW/CPU.cpp b/Source/Core/Core/HW/CPU.cpp
+index c84e082..5e797a9 100644
+--- a/Source/Core/Core/HW/CPU.cpp
++++ b/Source/Core/Core/HW/CPU.cpp
+@@ -282,6 +282,14 @@ bool CPUManager::IsStepping() const
+   return m_state == State::Stepping;
+ }
+ 
++#ifdef __LIBRETRO__
++bool CPUManager::IsCPUThreadIdle()
++{
++  std::lock_guard state_lock(m_state_change_lock);
++  return !m_state_cpu_thread_active;
++}
++#endif
++
+ State CPUManager::GetState() const
+ {
+   return m_state;
+diff --git a/Source/Core/Core/HW/CPU.h b/Source/Core/Core/HW/CPU.h
+index 6fa3bea..f221d53 100644
+--- a/Source/Core/Core/HW/CPU.h
++++ b/Source/Core/Core/HW/CPU.h
+@@ -82,6 +82,10 @@ public:
+   // Shorthand for GetState() == State::Stepping.
+   // WARNING: State::PowerDown will return false, not just State::Running.
+   bool IsStepping() const;
++#ifdef __LIBRETRO__
++  // Whether the CPU thread is parked (not executing guest code).
++  bool IsCPUThreadIdle();
++#endif
+ 
+   // Get current CPU Thread State
+   State GetState() const;
 diff --git a/Source/Core/Core/HW/DVD/AMMediaboard.cpp b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
 index fdafc56..c6839d1 100644
 --- a/Source/Core/Core/HW/DVD/AMMediaboard.cpp
@@ -4594,7 +4628,7 @@ index 159e6a6..361c500 100644
    Boot.cpp
    Host.cpp
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
-index 97ba667..a1a23cb 100644
+index 97ba667..b3d9fb0 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp
 +++ b/Source/Core/DolphinLibretro/Main.cpp
 @@ -1,4 +1,8 @@
@@ -4633,7 +4667,22 @@ index 97ba667..a1a23cb 100644
    Libretro::Input::InitSensors();
    Libretro::Options::CheckForUpdatedVariables();
    Libretro::FrameTiming::CheckForFastForwarding();
-@@ -552,6 +569,14 @@ void retro_run(void)
+@@ -545,6 +562,14 @@ void retro_run(void)
+   {
+     Core::DoFrameStep(system);
+     system.GetFifo().RunGpuLoop();
++#ifdef __EMSCRIPTEN__
++    // The CPU thread signals the end of the frame (StopGpuLoop) just before it
++    // pauses, and may still queue GPU work in between. Service it until the CPU
++    // thread is parked: otherwise a save state (the site saves every 30 s) or
++    // anything that flushes the GPU from the main thread waits on work only the
++    // main thread can run, and the page freezes.
++    system.GetFifo().RunGpuLoopUntilCPUIdle(50);
++#endif
+   }
+   else
+   {
+@@ -552,6 +577,14 @@ void retro_run(void)
    }
  
    RETRO_PERFORMANCE_STOP(dolphin_main_func);
@@ -7271,6 +7320,96 @@ index deb005b..65a1ea1 100644
  constexpr u32 m_os = OS_ALL;
  #endif
  
+diff --git a/Source/Core/VideoCommon/Fifo.cpp b/Source/Core/VideoCommon/Fifo.cpp
+index 42e3362..ae2f037 100644
+--- a/Source/Core/VideoCommon/Fifo.cpp
++++ b/Source/Core/VideoCommon/Fifo.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include "VideoCommon/Fifo.h"
+ 
++#include "Common/Timer.h"
++#include "Core/HW/CPU.h"
++
+ #include <atomic>
+ #include <cstring>
+ 
+@@ -301,6 +304,20 @@ void FifoManager::RunGpuLoop()
+ #ifdef __LIBRETRO__
+         if (m_stop_gpu_loop_requested.load())
+           m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
++#endif
++#ifdef __LIBRETRO__
++        if (m_stop_when_cpu_idle &&
++            (m_system.GetCPU().IsCPUThreadIdle() ||
++             Common::Timer::NowUs() >= m_stop_deadline_us))
++          m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
++#ifdef __EMSCRIPTEN__
++        // The loop normally ends when the CPU thread finishes the frame
++        // (StopGpuLoop). If the CPU is parked instead (a save state paused and
++        // resumed it at the wrong moment, then the frame step paused it), that
++        // never comes, and the browser's main thread would wait forever.
++        if (m_system.GetCPU().IsStepping() && m_system.GetCPU().IsCPUThreadIdle())
++          m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
++#endif
+ #endif
+ 
+         // Run events from the CPU thread.
+@@ -401,12 +418,30 @@ void FifoManager::RunGpuLoop()
+           g_framebuffer_manager->RefreshPeekCache();
+         }
+       },
++#if defined(__EMSCRIPTEN__)
++      1);  // the main thread can't sleep anyway; check the conditions above often
++#elif defined(__LIBRETRO__)
++      m_stop_when_cpu_idle ? 1 : 100);
++#else
+       100);
++#endif
+ #ifdef __LIBRETRO__
+   m_stop_gpu_loop_requested.store(false);
+ #endif
+ }
+ 
++#ifdef __LIBRETRO__
++void FifoManager::RunGpuLoopUntilCPUIdle(int max_ms)
++{
++  if (m_system.GetCPU().IsCPUThreadIdle())
++    return;
++  m_stop_when_cpu_idle = true;
++  m_stop_deadline_us = Common::Timer::NowUs() + static_cast<u64>(max_ms) * 1000;
++  RunGpuLoop();
++  m_stop_when_cpu_idle = false;
++}
++#endif
++
+ void FifoManager::FlushGpu()
+ {
+   if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
+diff --git a/Source/Core/VideoCommon/Fifo.h b/Source/Core/VideoCommon/Fifo.h
+index cff4e79..9b1b5f8 100644
+--- a/Source/Core/VideoCommon/Fifo.h
++++ b/Source/Core/VideoCommon/Fifo.h
+@@ -77,6 +77,10 @@ public:
+   void ResetVideoBuffer();
+ #ifdef __LIBRETRO__
+   void StopGpuLoop();
++  // Dual core on the web: keep running the GPU loop until the CPU thread has
++  // actually stopped for the frame (or max_ms passed), so nothing it queued is
++  // left waiting for the main thread between retro_run calls.
++  void RunGpuLoopUntilCPUIdle(int max_ms);
+ #endif
+ 
+ private:
+@@ -93,6 +97,8 @@ private:
+ #ifdef __LIBRETRO__
+   // Set by StopGpuLoop(), so that a stop requested before RunGpuLoop() got going still ends it.
+   std::atomic<bool> m_stop_gpu_loop_requested{false};
++  bool m_stop_when_cpu_idle = false;
++  u64 m_stop_deadline_us = 0;
+ #endif
+ 
+   Common::Flag m_emu_running_state;
 diff --git a/Source/Core/VideoCommon/Spirv.cpp b/Source/Core/VideoCommon/Spirv.cpp
 index 9fcef18..4b7b889 100644
 --- a/Source/Core/VideoCommon/Spirv.cpp

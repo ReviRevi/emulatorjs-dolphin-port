@@ -451,3 +451,16 @@ the Ubuntu bzip2 1.0.8 source. On a normal machine `scripts/setup.sh` (emsdk) av
 `clang --target=powerpc-unknown-eabi -mcpu=750`, linked at 0x80003100, converted with
 `elf2dol.py`. Sets VI for 480i and fills the XFB with moving bars. Its VI/YUV setup is
 approximate (bars are not perfectly placed) — it exists only to prove CPU + VI + XFB work.
+
+### Dual core: page freeze around save states (fixed)
+
+The site autosaves every 30 s. A save pauses the CPU and the GPU loop's
+"emulator running" flag; on the next `retro_run` the main thread entered
+`RunGpuLoop()` and returned early every pass ("do nothing while paused")
+while waiting for the CPU thread's end-of-frame `StopGpuLoop`, which never
+came. The browser's main thread was stuck, so the tab couldn't even reload.
+Fix: on emscripten the GPU loop now ends as soon as the CPU thread is parked
+(stepping and idle), checked before the paused early return; after each
+frame `RunGpuLoopUntilCPUIdle(50)` services any GPU work the CPU queued
+between its frame-end signal and parking. Headless test: 30 back-to-back
+saves in dual core with no hang; fpbench/brtest checksums unchanged.
