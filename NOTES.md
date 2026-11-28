@@ -379,6 +379,22 @@ table load, the dcache flag load, the page-crossing check and the RAM-range mask
 falls through to the old path. Safe because MMU::DBATUpdated clears the JIT cache. fpbench
 checksum unchanged.
 
+### Forward branches inside a compiled block
+
+TTYD gameplay trace (2026-11-28): ~24% of the main thread in five 6-instruction blocks at
+0x8014505c..0x801450c8 - one loop (64 iterations x 4 checks of a flag bit, collecting active
+entries) where each `beq` skips 3 instructions. A taken conditional branch left the block
+(EndBlockIfTaken), so every iteration crossed up to 5 block boundaries. Now, when the target of a
+forward `bc` (no link) is a later instruction of the same block reached in straight-line order
+(no followed branches or block ends in between) and properly nested inside any open region, the
+taken path is a `br_if` out of a wasm `block` that ends right before the target. Registers:
+dirty ones are flushed (kept dirty) before the branch, so memory is right on the taken path; at
+the join only registers loaded on both paths stay loaded, and ones first loaded and modified
+inside are written back at the end of the fall-through path. Skipped instructions' cycles still
+count against the downcount (slight over-count). `DOLPHIN_WASM_JIT_FWDBRANCH=0` disables it.
+Test: `test-content/brtest` (a copy of the TTYD loop plus nested forward branches): same checksum
+with and without, loop 35.4 -> 43.9 fps headless; fpbench checksum unchanged.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.

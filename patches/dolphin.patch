@@ -882,10 +882,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..2bda27b
+index 0000000..e5a9ad5
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2985 @@
+@@ -0,0 +1,3125 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -3731,6 +3731,118 @@ index 0000000..2bda27b
 +  };
 +
 +  c.Loop();  // target of the tight-loop branch in end_block_inline
++
++  // ---- forward branches inside the block ----
++  // A conditional branch that skips a few instructions ahead (beq over an
++  // `if` body) used to leave the block when taken, so a loop full of them ran
++  // as many tiny blocks with a dispatch between each (TTYD: 5 per iteration).
++  // When the target is a later instruction of this same block, reached in
++  // straight-line order, the taken path jumps there inside the function:
++  //   block            ; region
++  //     br_if 0 (taken)
++  //     ...skipped instructions...
++  //   end              ; target instruction follows
++  // Registers: dirty ones are written back before the branch (memory is right
++  // on the taken path); at the join only registers loaded on both paths stay
++  // loaded, and ones first loaded and modified inside are written back at the
++  // end of the fall-through path.
++  struct ScanEntry
++  {
++    const u8* p;
++    AnyCallback cb;
++    u32 pc;  // Interpret ops: the instruction's address, else 0
++  };
++  std::vector<ScanEntry> scan;
++  bool scan_ok = true;
++  for (const u8* q = p; q < end;)
++  {
++    const auto qcb = *reinterpret_cast<const AnyCallback*>(q);
++    const u8* qp = q + sizeof(AnyCallback);
++    std::size_t qsize = 0;
++    u32 qpc = 0;
++    if (qcb == AnyCallbackCast(Interpret<false>) || qcb == AnyCallbackCast(Interpret<true>))
++    {
++      qsize = sizeof(InterpretOperands);
++      qpc = reinterpret_cast<const InterpretOperands*>(qp)->current_pc;
++    }
++    else if (qcb == AnyCallbackCast(InterpretAndCheckExceptions<false>) ||
++             qcb == AnyCallbackCast(InterpretAndCheckExceptions<true>))
++      qsize = sizeof(InterpretAndCheckExceptionsOperands);
++    else if (qcb == AnyCallbackCast(EndBlock<false>))
++      qsize = sizeof(EndBlockOperands<false>);
++    else if (qcb == AnyCallbackCast(EndBlock<true>))
++      qsize = sizeof(EndBlockOperands<true>);
++    else if (qcb == AnyCallbackCast(EndBlockIfTaken))
++      qsize = sizeof(EndBlockIfTakenOperands);
++    else if (qcb == AnyCallbackCast(StartProfiledBlock))
++      qsize = sizeof(StartProfiledBlockOperands);
++    else if (qcb == AnyCallbackCast(HLEFunction))
++      qsize = sizeof(HLEFunctionOperands);
++    else if (qcb == AnyCallbackCast(WriteBrokenBlockNPC))
++      qsize = sizeof(WriteBrokenBlockNPCOperands);
++    else if (qcb == AnyCallbackCast(CheckFPU) || qcb == AnyCallbackCast(CheckBreakpoint))
++      qsize = sizeof(CheckHaltOperands);
++    else if (qcb == AnyCallbackCast(CheckIdle))
++      qsize = sizeof(CheckIdleOperands);
++    else
++    {
++      scan_ok = false;
++      break;
++    }
++    scan.push_back({q, qcb, qpc});
++    q = qp + qsize;
++  }
++  // Whether the instruction at `target` comes later in this block, reached
++  // through straight-line code from the entry after `from` (no followed
++  // branches or block ends in between).
++  auto target_ahead = [&](const u8* from, u32 branch_pc, u32 target) {
++    if (!scan_ok || WebGLDebugFlag("DOLPHIN_WASM_JIT_FWDBRANCH", 1) == 0)
++      return false;
++    std::size_t i = 0;
++    while (i < scan.size() && scan[i].p <= from)
++      i++;
++    u32 last = branch_pc;
++    for (; i < scan.size(); i++)
++    {
++      const auto& se = scan[i];
++      if (se.cb == AnyCallbackCast(EndBlock<false>) || se.cb == AnyCallbackCast(EndBlock<true>) ||
++          se.cb == AnyCallbackCast(HLEFunction) || se.cb == AnyCallbackCast(WriteBrokenBlockNPC))
++        return false;
++      if (se.pc == 0)
++        continue;
++      if (se.pc == target)
++        return true;
++      if (se.pc <= last || se.pc > target)
++        return false;
++      last = se.pc;
++    }
++    return false;
++  };
++  struct Region
++  {
++    u32 target;
++    u32 loaded0;
++  };
++  std::vector<Region> regions;
++  u32 prev_pc = 0;
++  UGeckoInstruction prev_inst{};
++  auto close_region = [&] {
++    const Region r = regions.back();
++    regions.pop_back();
++    // fall-through path: write back registers first loaded in here and changed
++    const u32 spill = emitter.dirty & ~r.loaded0;
++    for (u32 reg = 0; reg < 32; reg++)
++    {
++      if (!(spill & (1u << reg)))
++        continue;
++      c.I32ConstU(ppc);
++      c.LocalGet(L_GPR0 + reg);
++      c.I32Store(machine.gpr + 4 * reg);
++    }
++    c.End();
++    emitter.loaded &= r.loaded0;
++    emitter.dirty &= emitter.loaded;
++  };
 +  while (p < end)
 +  {
 +    const auto cb = *reinterpret_cast<const AnyCallback*>(p);
@@ -3739,6 +3851,10 @@ index 0000000..2bda27b
 +    if (cb == AnyCallbackCast(Interpret<false>) || cb == AnyCallbackCast(Interpret<true>))
 +    {
 +      const auto& op = *reinterpret_cast<const InterpretOperands*>(payload);
++      while (!regions.empty() && regions.back().target == op.current_pc)
++        close_region();
++      prev_pc = op.current_pc;
++      prev_inst = op.inst;
 +      if (cb == AnyCallbackCast(Interpret<true>))
 +      {
 +        c.I32ConstU(ppc);
@@ -3777,7 +3893,8 @@ index 0000000..2bda27b
 +      size = sizeof(EndBlockOperands<false>);
 +      if ((block.feature_flags & FEATURE_FLAG_PERFMON) == 0)
 +      {
-+        end_block_inline(*reinterpret_cast<const EndBlockOperands<false>*>(payload));
++        end_block_inline(*reinterpret_cast<const EndBlockOperands<false>*>(payload),
++                         static_cast<u32>(regions.size()));
 +        p = payload + size;
 +        continue;
 +      }
@@ -3790,13 +3907,34 @@ index 0000000..2bda27b
 +      if ((block.feature_flags & FEATURE_FLAG_PERFMON) == 0)
 +      {
 +        const auto& op = *reinterpret_cast<const EndBlockIfTakenOperands*>(payload);
++        const u32 target = prev_inst.OPCD == 16 && !prev_inst.LK ?
++                               u32(SignExt16(s16(prev_inst.BD << 2))) +
++                                   (prev_inst.AA ? 0 : prev_pc) :
++                               0;
++        if (!branch_watch && target > prev_pc && op.fallthrough_pc == prev_pc + 4 &&
++            (regions.empty() || target <= regions.back().target) &&
++            target_ahead(p, prev_pc, target))
++        {
++          // taken: npc != fall-through -> jump ahead within the block
++          emitter.Flush(true);
++          regions.push_back({target, emitter.loaded});
++          c.Block();
++          c.I32ConstU(ppc);
++          c.I32Load(machine.npc);
++          c.I32ConstU(op.fallthrough_pc);
++          c.I32Ne();
++          c.BrIf(0);
++          p = payload + size;
++          continue;
++        }
 +        // taken: npc != fall-through -> leave the block like EndBlock
 +        c.I32ConstU(ppc);
 +        c.I32Load(machine.npc);
 +        c.I32ConstU(op.fallthrough_pc);
 +        c.I32Ne();
 +        c.If();
-+        end_block_inline({op.downcount, op.num_load_stores, op.num_fp_inst}, 1, true);
++        end_block_inline({op.downcount, op.num_load_stores, op.num_fp_inst},
++                         1 + static_cast<u32>(regions.size()), true);
 +        c.End();
 +        p = payload + size;
 +        continue;
@@ -3823,6 +3961,8 @@ index 0000000..2bda27b
 +    p = payload + size;
 +  }
 +
++  while (!regions.empty())  // not expected: targets are checked to be ahead
++    close_region();
 +  c.End();        // loop
 +  c.I32Const(0);  // not reached: every block ends in EndBlock
 +  char name[24];
