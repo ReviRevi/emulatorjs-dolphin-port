@@ -526,3 +526,26 @@ FIFO replay of the baseball menu identical with async vs sync pipelines; 30
 saves without a hang in WebGPU single and dual core. (State tests need
 `--enable-unsafe-webgpu --use-webgpu-adapter=swiftshader`, otherwise the
 backend never starts and a save dereferences a null framebuffer manager.)
+
+### Vertex loader JIT, WebGPU command batching, persistent shader cache
+
+- **Vertex loader JIT** (`VideoCommon/VertexLoaderWasm.cpp`): each vertex format
+  compiles to a WebAssembly function `(src, dst, count) -> loaded`, a port of
+  VertexLoaderX64 (same native declaration, zfreeze caches, skipped vertices,
+  NTB/index3, all color formats). Installed in the compiling thread's function
+  table; another thread falls back to the software loader. Off with
+  `DOLPHIN_WASM_VERTEX_LOADER=0`. `Module.wasmVertexLoaders` counts compiled ones.
+  `WasmEmitter.h` gained f32 ops and a function-type parameter for `BuildModule`.
+- **Command batching:** texture/sampler/viewport/scissor/pipeline changes,
+  uniform uploads (data copied) and draws are queued in wasm memory and run by
+  `W.exec` in one call at the next call that needs a result (vertex/index
+  upload, texture work, present...). Off with `DOLPHIN_WEBGPU_BATCH=0`.
+  The thread checks now use an owner thread (`s_wgpu_owner`, main by default),
+  in preparation for the GPU worker.
+- **Shader cache:** translated WGSL is stored in IndexedDB (`dolphin-wgsl`),
+  keyed by a hash of the GLSL plus a hash of the translator code (changing the
+  translator drops stale entries). Off with `DOLPHIN_WEBGPU_SHADER_CACHE=0`.
+- JIT block linking and idle-loop skipping were already in place (blocks
+  return the next block; `CheckIdle` is handled).
+
+Headless: baseball menu FIFO replay renders identically with all three on.

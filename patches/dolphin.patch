@@ -4184,10 +4184,10 @@ index 6653297..8815b4e 100644
  #undef LOOKUP_KV
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
 new file mode 100644
-index 0000000..d8b0c10
+index 0000000..0e82da2
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/WasmEmitter.h
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,340 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -4404,12 +4404,23 @@ index 0000000..d8b0c10
 +  void I64ExtendI32U() { Byte(0xad); }
 +  void I32Extend8S() { Byte(0xc0); }
 +  void I32Extend16S() { Byte(0xc1); }
++  void F32ConvertI32S() { Byte(0xb2); }
++  void F32Mul() { Byte(0x94); }
++  void F32Const(float v)
++  {
++    Byte(0x43);
++    u32 bits;
++    std::memcpy(&bits, &v, 4);
++    for (int i = 0; i < 4; i++)
++      Byte(static_cast<u8>(bits >> (8 * i)));
++  }
 +};
 +
 +// Wraps a function body (locals + code) into a complete module.
 +// `locals` lists extra local declarations as (count, type) pairs.
 +inline std::vector<u8> BuildModule(const std::vector<std::pair<u32, u8>>& locals,
-+                                   const std::vector<u8>& code, const char* name = nullptr)
++                                   const std::vector<u8>& code, const char* name = nullptr,
++                                   u32 func_type = TYPE_I_V)
 +{
 +  CodeWriter m;
 +  // magic + version
@@ -4469,7 +4480,7 @@ index 0000000..d8b0c10
 +  {
 +    CodeWriter s;
 +    s.U32(1);
-+    s.U32(TYPE_I_V);
++    s.U32(func_type);
 +    section(3, s);
 +  }
 +  // Export section: "f"
@@ -5944,10 +5955,10 @@ index 0000000..d0dff41
 +)
 diff --git a/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp b/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp
 new file mode 100644
-index 0000000..db6c192
+index 0000000..4b2a372
 --- /dev/null
 +++ b/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1134 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -5959,6 +5970,7 @@ index 0000000..db6c192
 +#include <emscripten.h>
 +#include <emscripten/proxying.h>
 +#include <emscripten/threading.h>
++#include <pthread.h>
 +
 +#include <mutex>
 +#include <set>
@@ -6051,13 +6063,78 @@ index 0000000..db6c192
 +EM_JS(void, wgpu_flush_js, (), { if (Module.__wgpu) Module.__wgpu.flush(); });
 +EM_JS(void, wgpu_present_js, (int tid, unsigned fbo), { Module.__wgpu.present(tid, fbo); });
 +
++
++// The thread that owns the WebGPU device (the browser's main thread unless the
++// GPU worker took it over). Calls from other threads are proxied to it.
++static pthread_t s_wgpu_owner = 0;
++static bool OnWgpuThread()
++{
++  const pthread_t owner = s_wgpu_owner ? s_wgpu_owner : emscripten_main_runtime_thread_id();
++  return pthread_equal(pthread_self(), owner);
++}
++
++// Command batching: state changes, uniform uploads and draws are queued in
++// wasm memory and run by JS in one call (at the next call that needs an
++// answer, or at a flush/present), instead of one wasm->JS call each.
++// globalThis.DOLPHIN_WEBGPU_BATCH = 0 turns it off.
++enum WgpuOp : u32
++{
++  OP_TEX = 1,
++  OP_SAMP,
++  OP_VP,
++  OP_SC,
++  OP_PIPE,
++  OP_DRAW,
++  OP_DRAWI,
++  OP_UNIF,
++};
++EM_JS(void, wgpu_exec_js, (const u32* p, int words), { Module.__wgpu.exec(p >>> 0, words); });
++EM_JS(int, wgpu_batch_flag, (), {
++  var v = globalThis.DOLPHIN_WEBGPU_BATCH;
++  return v === undefined ? 1 : (+v ? 1 : 0);
++});
++static std::vector<u32> s_cmds;
++static bool WgpuBatching()
++{
++  static const bool on = wgpu_batch_flag() != 0;
++  return on;
++}
++static u32 WgpuBits(float f)
++{
++  u32 u;
++  std::memcpy(&u, &f, 4);
++  return u;
++}
++static void WgpuPush(std::initializer_list<u32> words)
++{
++  s_cmds.insert(s_cmds.end(), words);
++}
++static void WgpuPushUniforms(int slot, const void* p, int size)
++{
++  const size_t words = (static_cast<size_t>(size) + 3) / 4;
++  s_cmds.push_back(OP_UNIF);
++  s_cmds.push_back(static_cast<u32>(slot));
++  s_cmds.push_back(static_cast<u32>(size));
++  const size_t at = s_cmds.size();
++  s_cmds.resize(at + words);
++  std::memcpy(&s_cmds[at], p, size);
++}
++static void WgpuFlushCmds()
++{
++  if (s_cmds.empty())
++    return;
++  wgpu_exec_js(s_cmds.data(), static_cast<int>(s_cmds.size()));
++  s_cmds.clear();
++}
++
 +// Dual core: the WebGPU device and all its objects live in the browser's main
 +// thread. A call from another thread (the CPU thread) would find no device
 +// there and throw, so run it on the main thread instead, and say so once.
 +template <typename F>
 +static void WgpuProxySync(F&& f)
 +{
-+  emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(),
++  emscripten_proxy_sync(emscripten_proxy_get_system_queue(),
++                        s_wgpu_owner ? s_wgpu_owner : emscripten_main_runtime_thread_id(),
 +                        [](void* a) { (*static_cast<std::remove_reference_t<F>*>(a))(); }, &f);
 +}
 +static void WgpuOffMain(const char* name)
@@ -6074,353 +6151,424 @@ index 0000000..db6c192
 +
 +static int wgpu_state()
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_state");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_state_js(); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_state_js(); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_state_js();
 +}
 +
 +static int wgpu_feature(int i)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_feature");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_feature_js(i); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_feature_js(i); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_feature_js(i);
 +}
 +
 +static int wgpu_tex_create(int w, int h, int layers, int levels, int fmt, int rt)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_tex_create");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_tex_create_js(w, h, layers, levels, fmt, rt); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_tex_create_js(w, h, layers, levels, fmt, rt); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_tex_create_js(w, h, layers, levels, fmt, rt);
 +}
 +
 +static void wgpu_tex_destroy(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_tex_destroy");
-+    WgpuProxySync([&] { wgpu_tex_destroy_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_tex_destroy_js(id); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_tex_destroy_js(id);
 +}
 +
 +static void wgpu_tex_upload(int id, int level, int layer, int x, int y, int w, int h, int row_length, const void* ptr, int size)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_tex_upload");
-+    WgpuProxySync([&] { wgpu_tex_upload_js(id, level, layer, x, y, w, h, row_length, ptr, size); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_tex_upload_js(id, level, layer, x, y, w, h, row_length, ptr, size); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_tex_upload_js(id, level, layer, x, y, w, h, row_length, ptr, size);
 +}
 +
 +static void wgpu_tex_copy(int src, int sl, int slev, int sx, int sy, int dst, int dl, int dlev, int dx, int dy, int w, int h)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_tex_copy");
-+    WgpuProxySync([&] { wgpu_tex_copy_js(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_tex_copy_js(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_tex_copy_js(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h);
 +}
 +
 +static void wgpu_set_texture(int slot, int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_set_texture");
-+    WgpuProxySync([&] { wgpu_set_texture_js(slot, id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_set_texture_js(slot, id); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_TEX, static_cast<u32>(slot), static_cast<u32>(id)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_set_texture_js(slot, id);
 +}
 +
 +static void wgpu_set_sampler(int slot, unsigned tm0, unsigned tm1)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_set_sampler");
-+    WgpuProxySync([&] { wgpu_set_sampler_js(slot, tm0, tm1); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_set_sampler_js(slot, tm0, tm1); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_SAMP, static_cast<u32>(slot), static_cast<u32>(tm0), static_cast<u32>(tm1)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_set_sampler_js(slot, tm0, tm1);
 +}
 +
 +static int wgpu_fb_create(int color, int depth, const int* adds, int count)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_fb_create");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_fb_create_js(color, depth, adds, count); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_fb_create_js(color, depth, adds, count); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_fb_create_js(color, depth, adds, count);
 +}
 +
 +static void wgpu_fb_destroy(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_fb_destroy");
-+    WgpuProxySync([&] { wgpu_fb_destroy_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_fb_destroy_js(id); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_fb_destroy_js(id);
 +}
 +
 +static void wgpu_set_framebuffer(int id, int mode, float r, float g, float b, float a, float z)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_set_framebuffer");
-+    WgpuProxySync([&] { wgpu_set_framebuffer_js(id, mode, r, g, b, a, z); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_set_framebuffer_js(id, mode, r, g, b, a, z); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_set_framebuffer_js(id, mode, r, g, b, a, z);
 +}
 +
 +static void wgpu_set_viewport(float x, float y, float w, float h, float n, float f)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_set_viewport");
-+    WgpuProxySync([&] { wgpu_set_viewport_js(x, y, w, h, n, f); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_set_viewport_js(x, y, w, h, n, f); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_VP, WgpuBits(x), WgpuBits(y), WgpuBits(w), WgpuBits(h), WgpuBits(n), WgpuBits(f)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_set_viewport_js(x, y, w, h, n, f);
 +}
 +
 +static void wgpu_set_scissor(int x, int y, int w, int h)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_set_scissor");
-+    WgpuProxySync([&] { wgpu_set_scissor_js(x, y, w, h); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_set_scissor_js(x, y, w, h); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_SC, static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(w), static_cast<u32>(h)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_set_scissor_js(x, y, w, h);
 +}
 +
 +static int wgpu_shader_create(int stage, const char* src)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_shader_create");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_shader_create_js(stage, src); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_shader_create_js(stage, src); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_shader_create_js(stage, src);
 +}
 +
 +static void wgpu_shader_destroy(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_shader_destroy");
-+    WgpuProxySync([&] { wgpu_shader_destroy_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_shader_destroy_js(id); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_shader_destroy_js(id);
 +}
 +
 +static int wgpu_vfmt_create(const int* desc)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_vfmt_create");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_vfmt_create_js(desc); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_vfmt_create_js(desc); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_vfmt_create_js(desc);
 +}
 +
 +static int wgpu_pipeline_create(int vs, int fs, int vf, unsigned raster, unsigned depth, unsigned blend, unsigned fb, int usage)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_pipeline_create");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_pipeline_create_js(vs, fs, vf, raster, depth, blend, fb, usage); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_pipeline_create_js(vs, fs, vf, raster, depth, blend, fb, usage); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_pipeline_create_js(vs, fs, vf, raster, depth, blend, fb, usage);
 +}
 +
 +static void wgpu_pipeline_destroy(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_pipeline_destroy");
-+    WgpuProxySync([&] { wgpu_pipeline_destroy_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_pipeline_destroy_js(id); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_pipeline_destroy_js(id);
 +}
 +
 +static void wgpu_set_pipeline(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_set_pipeline");
-+    WgpuProxySync([&] { wgpu_set_pipeline_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_set_pipeline_js(id); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_PIPE, static_cast<u32>(id)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_set_pipeline_js(id);
 +}
 +
 +static int wgpu_vertices(const void* p, int size, int stride)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_vertices");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_vertices_js(p, size, stride); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_vertices_js(p, size, stride); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_vertices_js(p, size, stride);
 +}
 +
 +static int wgpu_indices(const void* p, int count)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_indices");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_indices_js(p, count); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_indices_js(p, count); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_indices_js(p, count);
 +}
 +
 +static void wgpu_uniforms(int slot, const void* p, int size)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_uniforms");
-+    WgpuProxySync([&] { wgpu_uniforms_js(slot, p, size); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_uniforms_js(slot, p, size); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPushUniforms(slot, p, size);
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_uniforms_js(slot, p, size);
 +}
 +
 +static void wgpu_draw(int base, int count)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_draw");
-+    WgpuProxySync([&] { wgpu_draw_js(base, count); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_draw_js(base, count); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_DRAW, static_cast<u32>(base), static_cast<u32>(count)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_draw_js(base, count);
 +}
 +
 +static void wgpu_draw_indexed(int bi, int count, int bv)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_draw_indexed");
-+    WgpuProxySync([&] { wgpu_draw_indexed_js(bi, count, bv); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_draw_indexed_js(bi, count, bv); });
 +    return;
 +  }
++  if (WgpuBatching())
++  {
++    WgpuPush({OP_DRAWI, static_cast<u32>(bi), static_cast<u32>(count), static_cast<u32>(bv)});
++    return;
++  }
++  WgpuFlushCmds();
 +  wgpu_draw_indexed_js(bi, count, bv);
 +}
 +
 +static int wgpu_st_create()
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_st_create");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_st_create_js(); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_st_create_js(); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_st_create_js();
 +}
 +
 +static void wgpu_st_destroy(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_st_destroy");
-+    WgpuProxySync([&] { wgpu_st_destroy_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_st_destroy_js(id); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_st_destroy_js(id);
 +}
 +
 +static void wgpu_st_copy_from(int sid, int tid, int layer, int level, int sx, int sy, int w, int h, int off, int stride)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_st_copy_from");
-+    WgpuProxySync([&] { wgpu_st_copy_from_js(sid, tid, layer, level, sx, sy, w, h, off, stride); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_st_copy_from_js(sid, tid, layer, level, sx, sy, w, h, off, stride); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_st_copy_from_js(sid, tid, layer, level, sx, sy, w, h, off, stride);
 +}
 +
 +static void wgpu_st_flush(int id)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_st_flush");
-+    WgpuProxySync([&] { wgpu_st_flush_js(id); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_st_flush_js(id); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_st_flush_js(id);
 +}
 +
 +static int wgpu_st_read(int id, void* p)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_st_read");
 +    int r = 0;
-+    WgpuProxySync([&] { r = wgpu_st_read_js(id, p); });
++    WgpuProxySync([&] { WgpuFlushCmds(); r = wgpu_st_read_js(id, p); });
 +    return r;
 +  }
++  WgpuFlushCmds();
 +  return wgpu_st_read_js(id, p);
 +}
 +
 +static void wgpu_flush()
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_flush");
-+    WgpuProxySync([&] { wgpu_flush_js(); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_flush_js(); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_flush_js();
 +}
 +
 +static void wgpu_present(int tid, unsigned fbo)
 +{
-+  if (!emscripten_is_main_browser_thread())
++  if (!OnWgpuThread())
 +  {
 +    WgpuOffMain("wgpu_present");
-+    WgpuProxySync([&] { wgpu_present_js(tid, fbo); });
++    WgpuProxySync([&] { WgpuFlushCmds(); wgpu_present_js(tid, fbo); });
 +    return;
 +  }
++  WgpuFlushCmds();
 +  wgpu_present_js(tid, fbo);
 +}
 +
@@ -7154,10 +7302,10 @@ index 0000000..e06e750
 +}  // namespace WGPU
 diff --git a/Source/Core/VideoBackends/WebGPU/WGPURuntime.js b/Source/Core/VideoBackends/WebGPU/WGPURuntime.js
 new file mode 100644
-index 0000000..6f366c0
+index 0000000..7fe9c05
 --- /dev/null
 +++ b/Source/Core/VideoBackends/WebGPU/WGPURuntime.js
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,807 @@
 +// WebGPU backend runtime for Dolphin (browser side). Evaluated once with `env`:
 +//   env.heap()  -> current HEAPU8      env.gl() -> current WebGL context (RetroArch's)
 +//   env.GL      -> Emscripten GL object tables    env.str(ptr) -> UTF8ToString
@@ -7191,6 +7339,7 @@ index 0000000..6f366c0
 +  if (W._kicked) return;
 +  W._kicked = true;
 +  try { initNaga(); } catch (e) { state = -1; err('naga init failed', e); return; }
++  try { cacheInit(); } catch (e) { err('shader cache init failed', e); }
 +  if (!navigator.gpu) { state = -1; err('navigator.gpu missing'); return; }
 +  navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).then(function(a) {
 +    if (!a) throw new Error('no WebGPU adapter');
@@ -7503,7 +7652,67 @@ index 0000000..6f366c0
 +  }
 +  return out + src.slice(last);
 +}
++// ---------------- shader cache ----------------
++// Translated WGSL is kept in IndexedDB, so shaders seen in an earlier session
++// skip the GLSL->WGSL translation (the expensive, synchronous part of a first
++// draw). Keys carry a hash of the translator code, so changing it invalidates
++// the cache. globalThis.DOLPHIN_WEBGPU_SHADER_CACHE = 0 turns it off.
++var wcache = new Map(), wdb = null, wqueue = [], wtimer = 0, wver = '';
++function hash53(str) {
++  var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
++  for (var i = 0, ch; i < str.length; i++) {
++    ch = str.charCodeAt(i);
++    h1 = Math.imul(h1 ^ ch, 2654435761);
++    h2 = Math.imul(h2 ^ ch, 1597334677);
++  }
++  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
++  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
++  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
++}
++function cacheOn() { var v = globalThis.DOLPHIN_WEBGPU_SHADER_CACHE; return (v === undefined || !!+v) && typeof indexedDB !== 'undefined'; }
++function cacheInit() {
++  wver = hash53(translate.toString() + splitSamplers.toString() + fixUniformBools.toString() + replaceCalls.toString());
++  if (!cacheOn()) return;
++  try {
++    var req = indexedDB.open('dolphin-wgsl', 1);
++    req.onupgradeneeded = function() { req.result.createObjectStore('w'); };
++    req.onsuccess = function() {
++      wdb = req.result;
++      var tx = wdb.transaction('w', 'readwrite'), st = tx.objectStore('w');
++      var kr = st.getAllKeys(), vr = st.getAll();
++      tx.oncomplete = function() {
++        var stale = [];
++        kr.result.forEach(function(k, i) { if (k.indexOf(wver + ':') === 0) { if (!wcache.has(k)) wcache.set(k, vr.result[i]); } else stale.push(k); });
++        if (stale.length) { var t2 = wdb.transaction('w', 'readwrite'); stale.forEach(function(k) { t2.objectStore('w').delete(k); }); }
++        log('shader cache: ' + wcache.size + ' shaders' + (stale.length ? ', dropped ' + stale.length + ' stale' : ''));
++        cacheFlush();
++      };
++    };
++    req.onerror = function() { wdb = null; };
++  } catch (e) { wdb = null; }
++}
++function cacheFlush() {
++  wtimer = 0;
++  if (!wdb || !wqueue.length) return;
++  try {
++    var tx = wdb.transaction('w', 'readwrite'), st = tx.objectStore('w');
++    wqueue.forEach(function(e) { st.put(e[1], e[0]); });
++  } catch (e) { /* storage full or closed: keep going without it */ }
++  wqueue = [];
++}
 +function toWgsl(glsl, stage) {
++  var key = wver + ':' + stage + ':' + glsl.length + ':' + hash53(glsl);
++  var hit = wcache.get(key);
++  if (hit) { stats.cacheHits = (stats.cacheHits || 0) + 1; return hit; }
++  var out = translate(glsl, stage);
++  if (out && cacheOn()) {
++    wcache.set(key, out);
++    wqueue.push([key, out]);
++    if (!wtimer) wtimer = setTimeout(cacheFlush, 2000);
++  }
++  return out;
++}
++function translate(glsl, stage) {
 +  var src = glsl.replace(/^\s*#\s*(line|extension|pragma)\b.*$/gm, '').replace(/^\s*#\s*version.*$/m, '#version 450');
 +  if (src.indexOf('#version') < 0) src = '#version 450\n' + src;
 +  src = splitSamplers(src);
@@ -7757,6 +7966,27 @@ index 0000000..6f366c0
 +W.draw = function(base, count) { if (applyState()) { pass.draw(count, 1, base, 0); stats.draws++; } else stats.skipped = (stats.skipped || 0) + 1; };
 +W.drawIndexed = function(bi, count, bv) { if (applyState()) { pass.drawIndexed(count, 1, bi, bv, 0); stats.draws++; } else stats.skipped = (stats.skipped || 0) + 1; };
 +
++// ---------------- batched commands ----------------
++// Run a queue of state changes and draws written by the C++ side (see
++// WgpuFlushCmds): one call from wasm instead of one per command.
++W.exec = function(ptr, words) {
++  var heap = H(), u32 = new Uint32Array(heap.buffer, ptr, words), f32 = new Float32Array(heap.buffer, ptr, words);
++  var i = 0;
++  while (i < words) {
++    switch (u32[i]) {
++    case 1: W.setTexture(u32[i + 1], u32[i + 2]); i += 3; break;
++    case 2: W.setSampler(u32[i + 1], u32[i + 2], u32[i + 3]); i += 4; break;
++    case 3: W.setViewport(f32[i + 1], f32[i + 2], f32[i + 3], f32[i + 4], f32[i + 5], f32[i + 6]); i += 7; break;
++    case 4: W.setScissor(u32[i + 1] | 0, u32[i + 2] | 0, u32[i + 3] | 0, u32[i + 4] | 0); i += 5; break;
++    case 5: W.setPipeline(u32[i + 1]); i += 2; break;
++    case 6: W.draw(u32[i + 1], u32[i + 2]); i += 3; break;
++    case 7: W.drawIndexed(u32[i + 1], u32[i + 2], u32[i + 3] | 0); i += 4; break;
++    case 8: { var size = u32[i + 2]; W.uniforms(u32[i + 1], ptr + (i + 3) * 4, size); i += 3 + ((size + 3) >> 2); break; }
++    default: err('bad batched command', u32[i], 'at', i); return;
++    }
++  }
++};
++
 +// ---------------- readback / staging ----------------
 +W.stCreate = function() { return put({ jobs: [], done: [] }); };
 +W.stDestroy = function(id) { O[id] = null; };
@@ -7916,15 +8146,16 @@ index 134a14f..1c8597a 100644
    if (pixel_format == PixelFormat::RGB8_Z24 || pixel_format == PixelFormat::RGB565_Z16 ||
        pixel_format == PixelFormat::Z24)
 diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
-index 69a0968..c552723 100644
+index 69a0968..89a0ea5 100644
 --- a/Source/Core/VideoCommon/CMakeLists.txt
 +++ b/Source/Core/VideoCommon/CMakeLists.txt
-@@ -293,3 +293,13 @@ if(MSVC)
+@@ -293,3 +293,14 @@ if(MSVC)
    # Add precompiled header
    target_link_libraries(videocommon PRIVATE use_pch)
  endif()
 +
 +if(EMSCRIPTEN)
++  target_sources(videocommon PRIVATE VertexLoaderWasm.cpp VertexLoaderWasm.h)
 +  # WebAssembly SIMD: lets the compiler vectorize texture decoding, hashing
 +  # and vertex loops (all current browsers support it).
 +  target_compile_options(videocommon PRIVATE -msimd128)
@@ -8159,6 +8390,684 @@ index 6f79564..b7aa04f 100644
    {
      out.Write("gl_ClipDistance[0] = clipDist0;\n"
                "gl_ClipDistance[1] = clipDist1;\n");
+diff --git a/Source/Core/VideoCommon/VertexLoaderBase.cpp b/Source/Core/VideoCommon/VertexLoaderBase.cpp
+index 98eb651..328a2ae 100644
+--- a/Source/Core/VideoCommon/VertexLoaderBase.cpp
++++ b/Source/Core/VideoCommon/VertexLoaderBase.cpp
+@@ -16,6 +16,9 @@
+ #include "Common/MsgHandler.h"
+ 
+ #include "VideoCommon/VertexLoader.h"
++#ifdef __EMSCRIPTEN__
++#include "VideoCommon/VertexLoaderWasm.h"
++#endif
+ #include "VideoCommon/VertexLoaderManager.h"
+ #include "VideoCommon/VertexLoader_Color.h"
+ #include "VideoCommon/VertexLoader_Normal.h"
+@@ -248,6 +251,13 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
+   native_loader = std::make_unique<VertexLoaderX64>(vtx_desc, vtx_attr);
+ #elif defined(_M_ARM_64)
+   native_loader = std::make_unique<VertexLoaderARM64>(vtx_desc, vtx_attr);
++#elif defined(__EMSCRIPTEN__)
++  if (VertexLoaderWasm::Enabled())
++  {
++    auto wasm_loader = std::make_unique<VertexLoaderWasm>(vtx_desc, vtx_attr);
++    if (wasm_loader->IsValid())
++      native_loader = std::move(wasm_loader);
++  }
+ #endif
+ 
+   // Use the software loader as a fallback
+diff --git a/Source/Core/VideoCommon/VertexLoaderWasm.cpp b/Source/Core/VideoCommon/VertexLoaderWasm.cpp
+new file mode 100644
+index 0000000..d80d8ef
+--- /dev/null
++++ b/Source/Core/VideoCommon/VertexLoaderWasm.cpp
+@@ -0,0 +1,601 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoCommon/VertexLoaderWasm.h"
++
++#include <array>
++#include <cstdint>
++
++#include <emscripten.h>
++
++#include "Common/Logging/Log.h"
++#include "Core/PowerPC/CachedInterpreter/WasmEmitter.h"
++#include "VideoCommon/CPMemory.h"
++#include "VideoCommon/VertexLoader.h"
++#include "VideoCommon/VertexLoaderManager.h"
++#include "VideoCommon/VertexLoaderUtils.h"
++
++// Installs a compiled module in this thread's function table (each thread has
++// its own table) and returns the slot, or 0 on failure.
++EM_JS(int, dolphin_vl_install, (const unsigned char* ptr, int len), {
++  try {
++    ptr >>>= 0;
++    var mod = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
++    var inst = new WebAssembly.Instance(mod, { e: { t: wasmTable, m: wasmMemory } });
++    var free = Module["__vlFree"] || (Module["__vlFree"] = []);
++    var idx = free.length ? free.pop() : wasmTable.grow(1);
++    wasmTable.set(idx, inst.exports["f"]);
++    Module["wasmVertexLoaders"] = (Module["wasmVertexLoaders"] || 0) + 1;
++    return idx;
++  } catch (e) {
++    Module["wasmVertexLoaderFailed"] = (Module["wasmVertexLoaderFailed"] || 0) + 1;
++    if (Module["wasmVertexLoaderFailed"] <= 5) console.error("Dolphin vertex loader JIT: " + e);
++    return 0;
++  }
++});
++EM_JS(void, dolphin_vl_free, (int idx), {
++  wasmTable.set(idx, null);
++  (Module["__vlFree"] || (Module["__vlFree"] = [])).push(idx);
++});
++EM_JS(int, dolphin_vl_enabled, (), {
++  var v = globalThis.DOLPHIN_WASM_VERTEX_LOADER;
++  return v === undefined ? 1 : (+v ? 1 : 0);
++});
++
++bool VertexLoaderWasm::Enabled()
++{
++  static const bool enabled = dolphin_vl_enabled() != 0;
++  return enabled;
++}
++
++namespace
++{
++using namespace WasmJit;
++
++enum Local : u32
++{
++  L_SRC = 0,
++  L_DST = 1,
++  L_COUNT = 2,
++  L_REM = 3,   // vertices left after this one (count - 1 down to 0), for zfreeze
++  L_SKIP = 4,  // vertices skipped (position index 0xFF / 0xFFFF)
++  L_ADDR = 5,  // base address of the current indexed attribute
++  L_T = 6,
++  L_V = 7,
++  L_F0 = 8,  // f32 lanes of the current attribute
++};
++
++u32 Addr(const void* p)
++{
++  return static_cast<u32>(reinterpret_cast<uintptr_t>(p));
++}
++
++struct Data
++{
++  u32 base;  // local holding the base address
++  u32 off;
++};
++
++class Gen
++{
++public:
++  CodeWriter c;
++  u32 src_ofs = 0;
++  u32 dst_ofs = 0;
++  PortableVertexDeclaration& decl;
++
++  explicit Gen(PortableVertexDeclaration& d) : decl(d) {}
++
++  void Bswap16()  // u16 in the low bits on the stack
++  {
++    c.LocalTee(L_T);
++    c.I32Const(8);
++    c.I32ShrU();
++    c.LocalGet(L_T);
++    c.I32Const(8);
++    c.I32Shl();
++    c.I32Or();
++    c.I32ConstU(0xFFFF);
++    c.I32And();
++  }
++  void Bswap32()
++  {
++    c.LocalTee(L_T);
++    c.I32Const(8);
++    c.I32Rotr();
++    c.I32ConstU(0xFF00FF00);
++    c.I32And();
++    c.LocalGet(L_T);
++    c.I32Const(8);
++    c.I32Rotl();
++    c.I32ConstU(0x00FF00FF);
++    c.I32And();
++    c.I32Or();
++  }
++
++  // Must be emitted at the top level of the vertex body: a skipped position
++  // branches out of it with depth 0.
++  Data GetVertexAddr(CPArray array, VertexComponentFormat attribute)
++  {
++    if (!IsIndexed(attribute))
++      return {L_SRC, src_ofs};
++    const bool i8 = attribute == VertexComponentFormat::Index8;
++    c.LocalGet(L_SRC);
++    if (i8)
++    {
++      c.I32Load8U(src_ofs);
++    }
++    else
++    {
++      c.I32Load16U(src_ofs);
++      Bswap16();
++    }
++    src_ofs += i8 ? 1 : 2;
++    c.LocalSet(L_ADDR);
++    if (array == CPArray::Position)
++    {
++      c.LocalGet(L_ADDR);
++      c.I32ConstU(i8 ? 0xFF : 0xFFFF);
++      c.I32Eq();
++      c.BrIf(0);
++    }
++    c.I32ConstU(Addr(&VertexLoaderManager::cached_arraybases[array]));
++    c.I32Load();
++    c.LocalGet(L_ADDR);
++    c.I32ConstU(Addr(&g_main_cp_state.array_strides[array]));
++    c.I32Load();
++    c.I32Mul();
++    c.I32Add();
++    c.LocalSet(L_ADDR);
++    return {L_ADDR, 0};
++  }
++
++  void Lane(int i, int count_in)
++  {
++    if (i < count_in)
++      c.LocalGet(L_F0 + i);
++    else
++      c.F32Const(0.0f);
++  }
++
++  void ReadVertex(Data data, VertexComponentFormat attribute, ComponentFormat format, int count_in,
++                  int count_out, bool dequantize, u8 scaling_exponent,
++                  AttributeFormat* native_format)
++  {
++    const int elem_size = GetElementSize(format);
++    const int load_bytes = elem_size * count_in;
++    const u32 dest = dst_ofs;
++
++    native_format->components = count_out;
++    native_format->enable = true;
++    native_format->offset = dst_ofs;
++    native_format->type = ComponentFormat::Float;
++    native_format->integer = false;
++    dst_ofs += sizeof(float) * count_out;
++    if (attribute == VertexComponentFormat::Direct)
++      src_ofs += load_bytes;
++
++    const bool is_float = format >= ComponentFormat::Float;
++    for (int i = 0; i < count_in; i++)
++    {
++      c.LocalGet(data.base);
++      switch (format)
++      {
++      case ComponentFormat::UByte:
++        c.I32Load8U(data.off + i);
++        c.F32ConvertI32S();
++        break;
++      case ComponentFormat::Byte:
++        c.I32Load8S(data.off + i);
++        c.F32ConvertI32S();
++        break;
++      case ComponentFormat::UShort:
++        c.I32Load16U(data.off + 2 * i);
++        Bswap16();
++        c.F32ConvertI32S();
++        break;
++      case ComponentFormat::Short:
++        c.I32Load16U(data.off + 2 * i);
++        Bswap16();
++        c.I32Extend16S();
++        c.F32ConvertI32S();
++        break;
++      default:  // Float and the invalid formats, read as float like VertexLoaderX64
++        c.I32Load(data.off + 4 * i);
++        Bswap32();
++        c.F32ReinterpretI32();
++        break;
++      }
++      if (!is_float && dequantize && scaling_exponent)
++      {
++        c.F32Const(1.0f / static_cast<float>(1u << scaling_exponent));
++        c.F32Mul();
++      }
++      c.LocalSet(L_F0 + i);
++    }
++    for (int i = 0; i < count_out; i++)
++    {
++      c.LocalGet(L_DST);
++      Lane(i, count_in);
++      c.F32Store(dest + 4 * i);
++    }
++
++    // zfreeze: the last vertices' positions and the last normal are cached.
++    if (native_format == &decl.position)
++    {
++      c.LocalGet(L_REM);
++      c.I32Const(3);
++      c.I32LtU();
++      c.If();
++      for (int j = 0; j < 4; j++)
++      {
++        c.I32ConstU(Addr(VertexLoaderManager::position_cache.data()));
++        c.LocalGet(L_REM);
++        c.I32Const(16);
++        c.I32Mul();
++        c.I32Add();
++        Lane(j, count_in);
++        c.F32Store(4 * j);
++      }
++      c.End();
++    }
++    else
++    {
++      const float* cache = nullptr;
++      if (native_format == &decl.normals[0])
++        cache = VertexLoaderManager::normal_cache.data();
++      else if (native_format == &decl.normals[1])
++        cache = VertexLoaderManager::tangent_cache.data();
++      else if (native_format == &decl.normals[2])
++        cache = VertexLoaderManager::binormal_cache.data();
++      if (cache)
++      {
++        c.LocalGet(L_REM);
++        c.I32Eqz();
++        c.If();
++        for (int j = 0; j < 4; j++)
++        {
++          c.I32ConstU(Addr(cache));
++          Lane(j, count_in);
++          c.F32Store(4 * j);
++        }
++        c.End();
++      }
++    }
++  }
++
++  // 5- or 6- or 4-bit field to 8 bits, with the value of `field` in L_T.
++  void Expand(int bits)
++  {
++    c.LocalTee(L_T);
++    c.I32Const(8 - bits);
++    c.I32Shl();
++    c.LocalGet(L_T);
++    c.I32Const(2 * bits - 8);
++    c.I32ShrU();
++    c.I32Or();
++  }
++  // Pushes ((L_V >> shift) & mask) expanded to 8 bits, shifted to byte `byte`.
++  void Field(int shift, int bits, int byte)
++  {
++    c.LocalGet(L_V);
++    if (shift)
++    {
++      c.I32Const(shift);
++      c.I32ShrU();
++    }
++    c.I32ConstU((1u << bits) - 1);
++    c.I32And();
++    if (bits == 4)
++    {
++      c.I32Const(17);
++      c.I32Mul();
++    }
++    else
++    {
++      Expand(bits);
++    }
++    if (byte)
++    {
++      c.I32Const(8 * byte);
++      c.I32Shl();
++    }
++  }
++
++  void ReadColor(Data data, VertexComponentFormat attribute, ColorFormat format)
++  {
++    int load_bytes = 0;
++    c.LocalGet(L_DST);
++    switch (format)
++    {
++    case ColorFormat::RGB888:
++    case ColorFormat::RGB888x:
++    case ColorFormat::RGBA8888:
++      c.LocalGet(data.base);
++      c.I32Load(data.off);
++      if (format != ColorFormat::RGBA8888)
++      {
++        c.I32ConstU(0xFF000000);
++        c.I32Or();
++      }
++      load_bytes = format == ColorFormat::RGB888 ? 3 : 4;
++      break;
++    case ColorFormat::RGB565:
++      c.LocalGet(data.base);
++      c.I32Load16U(data.off);
++      Bswap16();
++      c.LocalSet(L_V);
++      Field(11, 5, 0);
++      Field(5, 6, 1);
++      c.I32Or();
++      Field(0, 5, 2);
++      c.I32Or();
++      c.I32ConstU(0xFF000000);
++      c.I32Or();
++      load_bytes = 2;
++      break;
++    case ColorFormat::RGBA4444:
++      c.LocalGet(data.base);
++      c.I32Load16U(data.off);
++      Bswap16();
++      c.LocalSet(L_V);
++      Field(12, 4, 0);
++      Field(8, 4, 1);
++      c.I32Or();
++      Field(4, 4, 2);
++      c.I32Or();
++      Field(0, 4, 3);
++      c.I32Or();
++      load_bytes = 2;
++      break;
++    case ColorFormat::RGBA6666:
++    default:
++      c.LocalGet(data.base);
++      c.I32Load8U(data.off);
++      c.I32Const(16);
++      c.I32Shl();
++      c.LocalGet(data.base);
++      c.I32Load8U(data.off + 1);
++      c.I32Const(8);
++      c.I32Shl();
++      c.I32Or();
++      c.LocalGet(data.base);
++      c.I32Load8U(data.off + 2);
++      c.I32Or();
++      c.LocalSet(L_V);
++      Field(18, 6, 0);
++      Field(12, 6, 1);
++      c.I32Or();
++      Field(6, 6, 2);
++      c.I32Or();
++      Field(0, 6, 3);
++      c.I32Or();
++      load_bytes = 3;
++      break;
++    }
++    c.I32Store(dst_ofs);
++    if (attribute == VertexComponentFormat::Direct)
++      src_ofs += load_bytes;
++  }
++};
++}  // namespace
++
++VertexLoaderWasm::VertexLoaderWasm(const TVtxDesc& vtx_desc, const VAT& vtx_att)
++    : VertexLoaderBase(vtx_desc, vtx_att), m_thread(std::this_thread::get_id())
++{
++  Generate();
++}
++
++VertexLoaderWasm::~VertexLoaderWasm()
++{
++  if (m_fn && std::this_thread::get_id() == m_thread)
++    dolphin_vl_free(m_fn);
++}
++
++void VertexLoaderWasm::Generate()
++{
++  Gen g(m_native_vtx_decl);
++  CodeWriter& c = g.c;
++
++  // remaining = count - 1; skipped = 0
++  c.LocalGet(L_COUNT);
++  c.I32Const(1);
++  c.I32Sub();
++  c.LocalSet(L_REM);
++
++  c.Loop();
++  c.Block();  // $after
++  c.Block();  // $skipped (a skipped vertex branches here: src advances, dst doesn't)
++
++  if (m_VtxDesc.low.PosMatIdx)
++  {
++    c.LocalGet(L_SRC);
++    c.I32Load8U(g.src_ofs);
++    c.I32Const(0x3F);
++    c.I32And();
++    c.LocalSet(L_V);
++    c.LocalGet(L_DST);
++    c.LocalGet(L_V);
++    c.I32Store(g.dst_ofs);
++    c.LocalGet(L_REM);
++    c.I32Const(3);
++    c.I32LtU();
++    c.If();
++    c.I32ConstU(Addr(VertexLoaderManager::position_matrix_index_cache.data()));
++    c.LocalGet(L_REM);
++    c.I32Const(4);
++    c.I32Mul();
++    c.I32Add();
++    c.LocalGet(L_V);
++    c.I32Store(0);
++    c.End();
++
++    m_native_vtx_decl.posmtx.components = 4;
++    m_native_vtx_decl.posmtx.enable = true;
++    m_native_vtx_decl.posmtx.offset = g.dst_ofs;
++    m_native_vtx_decl.posmtx.type = ComponentFormat::UByte;
++    m_native_vtx_decl.posmtx.integer = true;
++    g.src_ofs += sizeof(u8);
++    g.dst_ofs += sizeof(u32);
++  }
++
++  std::array<u32, 8> texmatidx_ofs{};
++  for (size_t i = 0; i < m_VtxDesc.low.TexMatIdx.Size(); i++)
++  {
++    if (m_VtxDesc.low.TexMatIdx[i])
++      texmatidx_ofs[i] = g.src_ofs++;
++  }
++
++  Data data = g.GetVertexAddr(CPArray::Position, m_VtxDesc.low.Position);
++  const int pos_elements = m_VtxAttr.g0.PosElements == CoordComponentCount::XY ? 2 : 3;
++  g.ReadVertex(data, m_VtxDesc.low.Position, m_VtxAttr.g0.PosFormat, pos_elements, pos_elements,
++               m_VtxAttr.g0.ByteDequant, m_VtxAttr.g0.PosFrac, &m_native_vtx_decl.position);
++
++  if (m_VtxDesc.low.Normal != VertexComponentFormat::NotPresent)
++  {
++    static constexpr Common::EnumMap<u8, ComponentFormat::InvalidFloat7> SCALE_MAP = {7, 6, 15, 14,
++                                                                                      0, 0, 0,  0};
++    const u8 scaling_exponent = SCALE_MAP[m_VtxAttr.g0.NormalFormat];
++
++    data = g.GetVertexAddr(CPArray::Normal, m_VtxDesc.low.Normal);
++    g.ReadVertex(data, m_VtxDesc.low.Normal, m_VtxAttr.g0.NormalFormat, 3, 3, true,
++                 scaling_exponent, &m_native_vtx_decl.normals[0]);
++
++    if (m_VtxAttr.g0.NormalElements == NormalComponentCount::NTB)
++    {
++      const bool index3 = IsIndexed(m_VtxDesc.low.Normal) && m_VtxAttr.g0.NormalIndex3;
++      const int elem_size = GetElementSize(m_VtxAttr.g0.NormalFormat);
++      const u32 load_bytes = elem_size * 3;
++
++      if (index3)
++        data = g.GetVertexAddr(CPArray::Normal, m_VtxDesc.low.Normal);
++      Data tangent = data;
++      tangent.off += load_bytes;
++      g.ReadVertex(tangent, m_VtxDesc.low.Normal, m_VtxAttr.g0.NormalFormat, 3, 3, true,
++                   scaling_exponent, &m_native_vtx_decl.normals[1]);
++
++      if (index3)
++        data = g.GetVertexAddr(CPArray::Normal, m_VtxDesc.low.Normal);
++      Data binormal = data;
++      binormal.off += load_bytes * 2;
++      g.ReadVertex(binormal, m_VtxDesc.low.Normal, m_VtxAttr.g0.NormalFormat, 3, 3, true,
++                   scaling_exponent, &m_native_vtx_decl.normals[2]);
++    }
++  }
++
++  for (u8 i = 0; i < m_VtxDesc.low.Color.Size(); i++)
++  {
++    if (m_VtxDesc.low.Color[i] != VertexComponentFormat::NotPresent)
++    {
++      data = g.GetVertexAddr(CPArray::Color0 + i, m_VtxDesc.low.Color[i]);
++      g.ReadColor(data, m_VtxDesc.low.Color[i], m_VtxAttr.GetColorFormat(i));
++      m_native_vtx_decl.colors[i].components = 4;
++      m_native_vtx_decl.colors[i].enable = true;
++      m_native_vtx_decl.colors[i].offset = g.dst_ofs;
++      m_native_vtx_decl.colors[i].type = ComponentFormat::UByte;
++      m_native_vtx_decl.colors[i].integer = false;
++      g.dst_ofs += 4;
++    }
++  }
++
++  for (u8 i = 0; i < m_VtxDesc.high.TexCoord.Size(); i++)
++  {
++    const int elements = m_VtxAttr.GetTexElements(i) == TexComponentCount::ST ? 2 : 1;
++    if (m_VtxDesc.high.TexCoord[i] != VertexComponentFormat::NotPresent)
++    {
++      data = g.GetVertexAddr(CPArray::TexCoord0 + i, m_VtxDesc.high.TexCoord[i]);
++      g.ReadVertex(data, m_VtxDesc.high.TexCoord[i], m_VtxAttr.GetTexFormat(i), elements,
++                   m_VtxDesc.low.TexMatIdx[i] ? 2 : elements, m_VtxAttr.g0.ByteDequant,
++                   m_VtxAttr.GetTexFrac(i), &m_native_vtx_decl.texcoords[i]);
++    }
++    if (m_VtxDesc.low.TexMatIdx[i])
++    {
++      m_native_vtx_decl.texcoords[i].components = 3;
++      m_native_vtx_decl.texcoords[i].enable = true;
++      m_native_vtx_decl.texcoords[i].type = ComponentFormat::Float;
++      m_native_vtx_decl.texcoords[i].integer = false;
++      if (m_VtxDesc.high.TexCoord[i] != VertexComponentFormat::NotPresent)
++      {
++        c.LocalGet(L_DST);
++        c.LocalGet(L_SRC);
++        c.I32Load8U(texmatidx_ofs[i]);
++        c.F32ConvertI32S();
++        c.F32Store(g.dst_ofs);
++        g.dst_ofs += sizeof(float);
++      }
++      else
++      {
++        m_native_vtx_decl.texcoords[i].offset = g.dst_ofs;
++        c.LocalGet(L_DST);
++        c.F32Const(0.0f);
++        c.F32Store(g.dst_ofs);
++        c.LocalGet(L_DST);
++        c.F32Const(0.0f);
++        c.F32Store(g.dst_ofs + 4);
++        c.LocalGet(L_DST);
++        c.LocalGet(L_SRC);
++        c.I32Load8U(texmatidx_ofs[i]);
++        c.F32ConvertI32S();
++        c.F32Store(g.dst_ofs + 8);
++        g.dst_ofs += sizeof(float) * 3;
++      }
++    }
++  }
++
++  // Written vertex: advance dst.
++  c.LocalGet(L_DST);
++  c.I32ConstU(g.dst_ofs);
++  c.I32Add();
++  c.LocalSet(L_DST);
++  c.Br(1);  // -> $after
++  c.End();  // $skipped
++  c.LocalGet(L_SKIP);
++  c.I32Const(1);
++  c.I32Add();
++  c.LocalSet(L_SKIP);
++  c.End();  // $after
++
++  c.LocalGet(L_SRC);
++  c.I32ConstU(g.src_ofs);
++  c.I32Add();
++  c.LocalSet(L_SRC);
++  c.LocalGet(L_REM);
++  c.I32Const(1);
++  c.I32Sub();
++  c.LocalTee(L_REM);
++  c.I32Const(0);
++  c.I32GeS();
++  c.BrIf(0);  // -> loop
++  c.End();    // loop
++
++  c.LocalGet(L_COUNT);
++  c.LocalGet(L_SKIP);
++  c.I32Sub();
++
++  m_native_vtx_decl.stride = g.dst_ofs;
++  if (g.src_ofs != m_vertex_size)
++  {
++    ERROR_LOG_FMT(VIDEO, "Wasm vertex loader: size {} != expected {}", g.src_ofs, m_vertex_size);
++    return;
++  }
++
++  const std::vector<u8> module =
++      BuildModule({{5, I32}, {3, F32}}, c.bytes, "vertex_loader", TYPE_I_III);
++  m_fn = dolphin_vl_install(module.data(), static_cast<int>(module.size()));
++}
++
++int VertexLoaderWasm::RunVertices(const u8* src, u8* dst, int count)
++{
++  m_numLoadedVertices += count;
++  if (count <= 0)
++    return 0;
++  if (std::this_thread::get_id() != m_thread)
++  {
++    // The function only exists in the table of the thread that compiled it.
++    if (!m_fallback)
++      m_fallback = std::make_unique<VertexLoader>(m_VtxDesc, m_VtxAttr);
++    return m_fallback->RunVertices(src, dst, count);
++  }
++  using Fn = int (*)(const u8*, u8*, int);
++  return reinterpret_cast<Fn>(static_cast<uintptr_t>(m_fn))(src, dst, count);
++}
+diff --git a/Source/Core/VideoCommon/VertexLoaderWasm.h b/Source/Core/VideoCommon/VertexLoaderWasm.h
+new file mode 100644
+index 0000000..0a5885e
+--- /dev/null
++++ b/Source/Core/VideoCommon/VertexLoaderWasm.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Vertex loader for the browser build: each vertex format is compiled to a
++// small WebAssembly function, the way VertexLoaderX64 / VertexLoaderARM64 emit
++// native code. Mirrors VertexLoaderX64's output exactly (same native vertex
++// declaration, same zfreeze caches, same skipped-vertex handling).
++
++#pragma once
++
++#include <memory>
++#include <thread>
++
++#include "VideoCommon/VertexLoaderBase.h"
++
++class VertexLoaderWasm final : public VertexLoaderBase
++{
++public:
++  VertexLoaderWasm(const TVtxDesc& vtx_desc, const VAT& vtx_att);
++  ~VertexLoaderWasm() override;
++
++  // False when compiling or installing the function failed; the caller then
++  // uses the software loader.
++  bool IsValid() const { return m_fn != 0; }
++
++  int RunVertices(const u8* src, u8* dst, int count) override;
++
++  // Page switch: globalThis.DOLPHIN_WASM_VERTEX_LOADER = 0 turns it off.
++  static bool Enabled();
++
++private:
++  void Generate();
++
++  int m_fn = 0;  // function table index (per thread: only valid on m_thread)
++  std::thread::id m_thread;
++  std::unique_ptr<VertexLoaderBase> m_fallback;  // used from any other thread
++};
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
 index 2d5e28b..66c16d0 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
