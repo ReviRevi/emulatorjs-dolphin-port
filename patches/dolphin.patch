@@ -882,10 +882,10 @@ index 3b4c4a0..382db62 100644
    if (block.near_begin != block.near_end)
 diff --git a/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
 new file mode 100644
-index 0000000..4a62afe
+index 0000000..2bda27b
 --- /dev/null
 +++ b/Source/Core/Core/PowerPC/CachedInterpreter/CachedInterpreterWasm.cpp
-@@ -0,0 +1,2936 @@
+@@ -0,0 +1,2985 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -1074,6 +1074,9 @@ index 0000000..4a62afe
 +  u32 gp_ptr;       // offsetof(gather_pipe_ptr)
 +  u32 gp_base;      // offsetof(gather_pipe_base_ptr)
 +  u32 gpfifo;       // &GPFifoManager
++  u32 ram_size;     // Memory::GetRamSizeReal()
++  bool fast_ram;    // 0x80000000 + [0, ram_size) is BAT-mapped to RAM, cached, and
++                    // data cache emulation is off: see Translate
 +  bool dr;          // the block runs with MSR.DR set (blocks are per MSR.DR/IR,
 +                    // and instructions that change the MSR end the block)
 +};
@@ -1577,6 +1580,34 @@ index 0000000..4a62afe
 +  // cache emulation, or a cache-inhibited store that isn't a full aligned word.
 +  // Mirrors MMU::ReadFromHardware / WriteToHardware for the RAM case.
 +  void Translate(u32 size, bool store, u32 depth)
++  {
++    // Fast path: games keep main RAM at 0x80000000 with the standard cached
++    // BAT, so an address in [0x80000000, 0x80000000 + RAM size) is just an
++    // offset into RAM. Checked at compile time (fast_ram): blocks are thrown
++    // away when the BATs change (MMU::DBATUpdated clears the JIT cache).
++    // RAM is contiguous on the host, so page crossings don't matter here.
++    if (m.fast_ram && m.dr)
++    {
++      c.LocalGet(L_EA);
++      c.I32ConstU(0x80000000);
++      c.I32Sub();
++      c.LocalTee(L_PHYS);
++      c.I32ConstU(m.ram_size - size);
++      c.I32LeU();
++      c.If();
++      c.LocalGet(L_PHYS);
++      c.I32ConstU(m.ram);
++      c.I32Add();
++      c.LocalSet(L_HOST);
++      c.Else();
++      TranslateGeneric(size, store, depth + 1);
++      c.End();
++      return;
++    }
++    TranslateGeneric(size, store, depth);
++  }
++
++  void TranslateGeneric(u32 size, bool store, u32 depth)
 +  {
 +    if (size > 1)
 +    {
@@ -3514,6 +3545,22 @@ index 0000000..4a62afe
 +  const u32 off_npc = offsetof(PowerPC::PowerPCState, npc);
 +
 +  auto& memory = m_system.GetMemory();
++  // Whether main RAM sits at 0x80000000 with the standard cached BAT mapping
++  // (and data cache emulation is off), for Emitter::Translate's fast path.
++  const auto FastRamMapped = [&] {
++    if (m_ppc_state.m_enable_dcache)
++      return false;
++    const auto& dbat = m_system.GetMMU().GetDBATTable();
++    const u32 size = memory.GetRamSizeReal();
++    for (u32 ea = 0x80000000; ea < 0x80000000 + size; ea += PowerPC::BAT_PAGE_SIZE)
++    {
++      const u32 e = dbat[ea >> PowerPC::BAT_INDEX_SHIFT];
++      if (!(e & PowerPC::BAT_MAPPED_BIT) || (e & PowerPC::BAT_WI_BIT) ||
++          (e & PowerPC::BAT_RESULT_MASK) != ea - 0x80000000)
++        return false;
++    }
++    return true;
++  };
 +  const Machine machine{
 +      ppc,
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr)),
@@ -3540,6 +3587,8 @@ index 0000000..4a62afe
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_ptr)),
 +      static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_base_ptr)),
 +      static_cast<u32>(reinterpret_cast<uintptr_t>(&m_system.GetGPFifo())),
++      memory.GetRamSizeReal(),
++      FastRamMapped(),
 +      (block.feature_flags & FEATURE_FLAG_MSR_DR) != 0,
 +  };
 +  const bool branch_watch = m_system.GetPowerPC().GetBranchWatch().GetRecordingActive();

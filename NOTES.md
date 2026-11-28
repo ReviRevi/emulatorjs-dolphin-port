@@ -368,6 +368,17 @@ gameplay ~10%), and WebGPU texture/vertex uploads read the wrong memory (garbage
 gameplay). Every EM_JS that takes a pointer now does `p >>> 0` (JIT install, all wgpu_* stubs,
 UTF8ToString calls, GL stats).
 
+### RAM fast path for compiled loads/stores
+
+Trace after the 2 GB fix (baseball gameplay, steady state): compiled PowerPC code 61-65% of the
+main thread, GPU side 21-26%, dispatcher 3-4%, Interpreter ~0 (the 12% dispatcher in earlier
+traces was warm-up). `Emitter::Translate` now starts with a fast path when, at compile time, the
+DBAT table maps 0x80000000 + [0, RAM size) to physical RAM, cached, and data cache emulation is
+off (`fast_ram`): `ea - 0x80000000 <= ram_size - size` -> host = ram + offset, skipping the BAT
+table load, the dcache flag load, the page-crossing check and the RAM-range masking. Anything else
+falls through to the old path. Safe because MMU::DBATUpdated clears the JIT cache. fpbench
+checksum unchanged.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
