@@ -464,3 +464,13 @@ Fix: on emscripten the GPU loop now ends as soon as the CPU thread is parked
 frame `RunGpuLoopUntilCPUIdle(50)` services any GPU work the CPU queued
 between its frame-end signal and parking. Headless test: 30 back-to-back
 saves in dual core with no hang; fpbench/brtest checksums unchanged.
+
+### Dual core: main thread never blocks on the CPU thread without servicing the GPU
+
+`CPUManager::PauseAndLock` and `SetStepping(true)` wait for the CPU thread to
+go idle. In the browser the GPU work only runs when the main thread runs the
+GPU loop, so if the CPU thread was itself waiting on the GPU (EFB peek, full
+FIFO, swap) that wait deadlocked and froze the tab. On emscripten, in dual
+core, on the main thread, the wait now runs the GPU loop in 2 ms slices
+(`WaitForCPUThreadIdle`). Not reproduced headless; written for reports of
+Gauntlet freezing at boot in dual core.

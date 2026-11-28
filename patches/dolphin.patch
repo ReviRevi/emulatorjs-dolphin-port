@@ -599,10 +599,50 @@ index f0c62d4..158d4ac 100644
        }
      }
 diff --git a/Source/Core/Core/HW/CPU.cpp b/Source/Core/Core/HW/CPU.cpp
-index c84e082..5e797a9 100644
+index c84e082..38edb5a 100644
 --- a/Source/Core/Core/HW/CPU.cpp
 +++ b/Source/Core/Core/HW/CPU.cpp
-@@ -282,6 +282,14 @@ bool CPUManager::IsStepping() const
+@@ -3,6 +3,10 @@
+ 
+ #include "Core/HW/CPU.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
++
+ #include <condition_variable>
+ #include <mutex>
+ #include <queue>
+@@ -259,6 +263,28 @@ void CPUManager::RunAdjacentSystems(bool running)
+     AudioCommon::SetSoundStreamRunning(m_system, running);
+ }
+ 
++void CPUManager::WaitForCPUThreadIdle(std::unique_lock<std::mutex>& state_lock)
++{
++#ifdef __EMSCRIPTEN__
++  // In dual core the GPU work only runs when the browser's main thread runs the
++  // GPU loop. If the CPU thread is blocked on the GPU (an EFB peek, a full FIFO,
++  // a swap) a plain wait here would deadlock and freeze the page, so keep
++  // servicing the GPU while waiting.
++  if (m_system.IsDualCoreMode() && emscripten_is_main_browser_thread())
++  {
++    while (m_state_cpu_thread_active)
++    {
++      state_lock.unlock();
++      m_system.GetFifo().RunGpuLoopUntilCPUIdle(2);
++      state_lock.lock();
++    }
++    return;
++  }
++#endif
++  while (m_state_cpu_thread_active)
++    m_state_cpu_idle_cvar.wait(state_lock);
++}
++
+ void CPUManager::Stop()
+ {
+   // Change state and wait for it to be acknowledged.
+@@ -282,6 +308,14 @@ bool CPUManager::IsStepping() const
    return m_state == State::Stepping;
  }
  
@@ -617,8 +657,32 @@ index c84e082..5e797a9 100644
  State CPUManager::GetState() const
  {
    return m_state;
+@@ -337,10 +371,7 @@ void CPUManager::SetStepping(bool stepping)
+     SetStateLocked(State::Stepping);
+ 
+     if (!Core::IsCPUThread())
+-    {
+-      while (m_state_cpu_thread_active)
+-        m_state_cpu_idle_cvar.wait(state_lock);
+-    }
++      WaitForCPUThreadIdle(state_lock);
+ 
+     RunAdjacentSystems(false);
+   }
+@@ -387,10 +418,7 @@ bool CPUManager::PauseAndLock()
+   const bool was_unpaused = m_state == State::Running;
+   SetStateLocked(State::Stepping);
+ 
+-  while (m_state_cpu_thread_active)
+-  {
+-    m_state_cpu_idle_cvar.wait(state_lock);
+-  }
++  WaitForCPUThreadIdle(state_lock);
+ 
+   state_lock.unlock();
+ 
 diff --git a/Source/Core/Core/HW/CPU.h b/Source/Core/Core/HW/CPU.h
-index 6fa3bea..f221d53 100644
+index 6fa3bea..55654c1 100644
 --- a/Source/Core/Core/HW/CPU.h
 +++ b/Source/Core/Core/HW/CPU.h
 @@ -82,6 +82,10 @@ public:
@@ -632,6 +696,14 @@ index 6fa3bea..f221d53 100644
  
    // Get current CPU Thread State
    State GetState() const;
+@@ -114,6 +118,7 @@ public:
+   }
+ #endif
+ private:
++  void WaitForCPUThreadIdle(std::unique_lock<std::mutex>& state_lock);
+   void FlushStepSyncEventLocked();
+   void ExecutePendingJobs(std::unique_lock<std::mutex>& state_lock);
+   void StartTimePlayedTimer();
 diff --git a/Source/Core/Core/HW/DVD/AMMediaboard.cpp b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
 index fdafc56..c6839d1 100644
 --- a/Source/Core/Core/HW/DVD/AMMediaboard.cpp
