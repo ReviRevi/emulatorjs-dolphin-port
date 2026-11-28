@@ -52,6 +52,41 @@ index 66a074a..595001e 100644
  elseif(ANDROID)
    target_sources(common PRIVATE
      Logging/ConsoleListenerDroid.cpp
+diff --git a/Source/Core/Common/GL/GLUtil.h b/Source/Core/Common/GL/GLUtil.h
+index a2225ec..69c417c 100644
+--- a/Source/Core/Common/GL/GLUtil.h
++++ b/Source/Core/Common/GL/GLUtil.h
+@@ -12,6 +12,30 @@ class GLContext;
+ // Texture which we use to not disturb the other bindings.
+ constexpr GLenum GL_MUTABLE_TEXTURE_INDEX = GL_TEXTURE10;
+ 
++#ifdef __EMSCRIPTEN__
++// Running totals of WebGL work, read by the page (Module.dolphinGLStats -> a
++// Uint32Array view: see OGLGfx). The page diffs them per second.
++struct WebGLStats
++{
++  unsigned draws;
++  unsigned buffer_uploads;
++  unsigned buffer_kb;
++  unsigned texture_uploads;
++  unsigned texture_kb;
++  unsigned shader_compiles;
++  unsigned program_links;
++  unsigned readbacks;
++  unsigned efb_copies;
++  unsigned texture_binds;
++  unsigned program_binds;
++  unsigned flushes;
++};
++inline WebGLStats g_webgl_stats{};
++#define WEBGL_STAT(field, n) (g_webgl_stats.field += (n))
++#else
++#define WEBGL_STAT(field, n) ((void)0)
++#endif
++
+ namespace GLUtil
+ {
+ GLuint CompileProgram(const std::string& vertexShader, const std::string& fragmentShader);
 diff --git a/Source/Core/Common/MemArena.h b/Source/Core/Common/MemArena.h
 index f2f86ee..eb16b84 100644
 --- a/Source/Core/Common/MemArena.h
@@ -3317,13 +3352,38 @@ index a3f108e..73f84ff 100644
  }
  
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.cpp b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-index ff5402b..5701b3d 100644
+index ff5402b..50c3da8 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLGfx.cpp
-@@ -271,14 +271,44 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
+@@ -6,6 +6,9 @@
+ #include "Common/GL/GLContext.h"
+ #include "Common/GL/GLExtensions/GLExtensions.h"
+ #include "Common/GL/GLUtil.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ #include "Common/Logging/LogManager.h"
+ 
+ #include "VideoBackends/OGL/OGLConfig.h"
+@@ -271,14 +274,67 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
    glDepthRangef(near_depth, far_depth);
  }
  
++#ifdef __EMSCRIPTEN__
++EM_JS(void, dolphin_publish_gl_stats, (void* ptr, int count), {
++  Module.dolphinGLStatsPtr = ptr;
++  Module.dolphinGLStatsNames = ["draws", "buffer_uploads", "buffer_kb", "texture_uploads",
++                                "texture_kb", "shader_compiles", "program_links", "readbacks",
++                                "efb_copies", "texture_binds", "program_binds", "flushes"];
++  Module.dolphinGLStats = function() {
++    var o = {}, base = Module.dolphinGLStatsPtr >> 2;
++    for (var i = 0; i < Module.dolphinGLStatsNames.length; i++)
++      o[Module.dolphinGLStatsNames[i]] = Module.HEAPU32[base + i] >>> 0;
++    return o;
++  };
++});
++#endif
++
 +void OGLGfx::BreakFeedbackLoops()
 +{
 +  // WebGL refuses any draw while a texture attached to the bound framebuffer is
@@ -3331,6 +3391,12 @@ index ff5402b..5701b3d 100644
 +  // formed between Framebuffer and active Texture"), even if it isn't sampled.
 +  // Desktop GL allows this. Dolphin leaves stale bindings, e.g. a texture-cache
 +  // entry it later renders into: unbind those.
++  static bool published = false;
++  if (!published)
++  {
++    published = true;
++    dolphin_publish_gl_stats(&g_webgl_stats, sizeof(g_webgl_stats) / 4);
++  }
 +  if (!m_current_framebuffer)
 +    return;
 +  const AbstractTexture* color = m_current_framebuffer->GetColorAttachment();
@@ -3352,6 +3418,7 @@ index ff5402b..5701b3d 100644
  {
 +#ifdef __EMSCRIPTEN__
 +  BreakFeedbackLoops();
++  WEBGL_STAT(draws, 1);
 +#endif
    glDrawArrays(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(), base_vertex,
                 num_vertices);
@@ -3361,10 +3428,27 @@ index ff5402b..5701b3d 100644
  {
 +#ifdef __EMSCRIPTEN__
 +  BreakFeedbackLoops();
++  WEBGL_STAT(draws, 1);
 +#endif
    if (g_ogl_config.bSupportsGLBaseVertex)
    {
      glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
+@@ -450,6 +506,7 @@ void OGLGfx::Flush()
+   // ensure all commands are sent to the GPU.
+   // Otherwise the driver could batch several frames together.
+   glFlush();
++  WEBGL_STAT(flushes, 1);
+ }
+ 
+ void OGLGfx::WaitForGPUIdle()
+@@ -644,6 +701,7 @@ void OGLGfx::SetTexture(u32 index, const AbstractTexture* texture)
+   if (m_bound_textures[index] == gl_texture)
+     return;
+ 
++  WEBGL_STAT(texture_binds, 1);
+   glActiveTexture(GL_TEXTURE0 + index);
+   if (gl_texture)
+     glBindTexture(gl_texture->GetGLTarget(), gl_texture->GetGLTextureId());
 diff --git a/Source/Core/VideoBackends/OGL/OGLGfx.h b/Source/Core/VideoBackends/OGL/OGLGfx.h
 index cad88fc..9faf991 100644
 --- a/Source/Core/VideoBackends/OGL/OGLGfx.h
@@ -3396,10 +3480,22 @@ index df0c28a..2b7af87 100644
    g_backend_info.bSupportsMultithreading = false;
    g_backend_info.bSupportsCopyToVram = true;
 diff --git a/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp b/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
-index 2eec584..fae48f3 100644
+index 2eec584..1a3728d 100644
 --- a/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLStreamBuffer.cpp
-@@ -315,7 +315,13 @@ public:
+@@ -3,6 +3,11 @@
+ 
+ #include "VideoBackends/OGL/OGLStreamBuffer.h"
+ 
++#include "Common/GL/GLUtil.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
++
+ #include "Common/Align.h"
+ #include "Common/MathUtil.h"
+ #include "Common/MemoryUtil.h"
+@@ -315,7 +320,15 @@ public:
  
    ~BufferSubData() override { delete[] m_pointer; }
    std::pair<u8*, u32> Map(u32 size) override { return std::make_pair(m_pointer, 0); }
@@ -3410,20 +3506,46 @@ index 2eec584..fae48f3 100644
 +    // rebound since Map() (WebGL rejects the upload with "no buffer").
 +    glBindBuffer(m_buffertype, m_buffer);
 +    glBufferSubData(m_buffertype, 0, used_size, m_pointer);
++    WEBGL_STAT(buffer_uploads, 1);
++    WEBGL_STAT(buffer_kb, used_size >> 10);
 +  }
    u8* m_pointer;
  };
  
-@@ -337,6 +343,7 @@ public:
+@@ -337,15 +350,31 @@ public:
    std::pair<u8*, u32> Map(u32 size) override { return std::make_pair(m_pointer, 0); }
    void Unmap(u32 used_size) override
    {
 +    glBindBuffer(m_buffertype, m_buffer);
      glBufferData(m_buffertype, used_size, m_pointer, GL_STREAM_DRAW);
++    WEBGL_STAT(buffer_uploads, 1);
++    WEBGL_STAT(buffer_kb, used_size >> 10);
    }
  
+   u8* m_pointer;
+ };
+ 
+ // Chooses the best streaming method based on the supported extensions and known issues
++#ifdef __EMSCRIPTEN__
++EM_JS(int, dolphin_gl_stream_mode, (), {
++  var v = globalThis.DOLPHIN_GL_STREAM;
++  return v === undefined ? 0 : (v | 0);
++});
++#endif
++
+ std::unique_ptr<StreamBuffer> StreamBuffer::Create(u32 type, u32 size)
+ {
++#ifdef __EMSCRIPTEN__
++  // A/B switch for WebGL: 0 = glBufferSubData into one buffer (default),
++  // 1 = glBufferData (orphan: a fresh allocation per upload).
++  if (dolphin_gl_stream_mode() == 1)
++    return std::make_unique<BufferData>(type, size);
++#endif
+   // without basevertex support, only streaming methods whith uploads everything to zero works fine:
+   if (!g_ogl_config.bSupportsGLBaseVertex)
+   {
 diff --git a/Source/Core/VideoBackends/OGL/OGLTexture.cpp b/Source/Core/VideoBackends/OGL/OGLTexture.cpp
-index 003a7ec..fa23168 100644
+index 003a7ec..4f65466 100644
 --- a/Source/Core/VideoBackends/OGL/OGLTexture.cpp
 +++ b/Source/Core/VideoBackends/OGL/OGLTexture.cpp
 @@ -3,9 +3,14 @@
@@ -3441,7 +3563,16 @@ index 003a7ec..fa23168 100644
  #include "Common/MsgHandler.h"
  
  #include "VideoBackends/OGL/OGLConfig.h"
-@@ -416,6 +421,11 @@ OGLStagingTexture::OGLStagingTexture(StagingTextureType type, const TextureConfi
+@@ -285,6 +290,8 @@ void OGLTexture::Load(u32 level, u32 width, u32 height, u32 row_length, const u8
+   if (layer >= m_config.layers)
+     PanicAlertFmt("Texture only has {} layer, can't update layer {}", m_config.layers, layer);
+ 
++  WEBGL_STAT(texture_uploads, 1);
++  WEBGL_STAT(texture_kb, static_cast<unsigned>(buffer_size >> 10));
+   const auto expected_width = std::max(1U, m_config.width >> level);
+   const auto expected_height = std::max(1U, m_config.height >> level);
+   if (width != expected_width || height != expected_height)
+@@ -416,6 +423,11 @@ OGLStagingTexture::OGLStagingTexture(StagingTextureType type, const TextureConfi
  
  OGLStagingTexture::~OGLStagingTexture()
  {
@@ -3453,7 +3584,7 @@ index 003a7ec..fa23168 100644
    if (m_fence != nullptr)
      glDeleteSync(m_fence);
    if (m_map_pointer)
-@@ -433,6 +443,18 @@ std::unique_ptr<OGLStagingTexture> OGLStagingTexture::Create(StagingTextureType
+@@ -433,6 +445,18 @@ std::unique_ptr<OGLStagingTexture> OGLStagingTexture::Create(StagingTextureType
  {
    size_t stride = config.GetStride();
    size_t buffer_size = stride * config.height;
@@ -3472,7 +3603,7 @@ index 003a7ec..fa23168 100644
    GLenum target =
        type == StagingTextureType::Readback ? GL_PIXEL_PACK_BUFFER : GL_PIXEL_UNPACK_BUFFER;
    GLuint buffer;
-@@ -490,6 +512,68 @@ void OGLStagingTexture::CopyFromTexture(const AbstractTexture* src,
+@@ -490,6 +514,69 @@ void OGLStagingTexture::CopyFromTexture(const AbstractTexture* src,
    ASSERT(dst_rect.left >= 0 && static_cast<u32>(dst_rect.right) <= m_config.width &&
           dst_rect.top >= 0 && static_cast<u32>(dst_rect.bottom) <= m_config.height);
  
@@ -3501,6 +3632,7 @@ index 003a7ec..fa23168 100644
 +                              src_level, src_layer);
 +    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, 0, 0, 0);
 +    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    WEBGL_STAT(readbacks, 1);
 +    glReadPixels(src_rect.left, src_rect.top, w, h, GL_RGBA,
 +                 is_float ? GL_FLOAT : GL_UNSIGNED_BYTE, temp.data());
 +    glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -3541,7 +3673,7 @@ index 003a7ec..fa23168 100644
    // Unmap the buffer before writing when not using persistent mappings.
    if (!UsePersistentStagingBuffers())
      OGLStagingTexture::Unmap();
-@@ -565,6 +649,47 @@ void OGLStagingTexture::CopyToTexture(const MathUtil::Rectangle<int>& src_rect,
+@@ -565,6 +652,47 @@ void OGLStagingTexture::CopyToTexture(const MathUtil::Rectangle<int>& src_rect,
    const OGLTexture* gltex = static_cast<const OGLTexture*>(dst);
    const size_t src_offset = src_rect.top * m_config.GetStride() + src_rect.left * m_texel_size;
    const size_t copy_size = src_rect.GetHeight() * m_config.GetStride();
@@ -3589,7 +3721,7 @@ index 003a7ec..fa23168 100644
  
    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_buffer_name);
    glPixelStorei(GL_UNPACK_ROW_LENGTH, m_config.width);
-@@ -629,6 +754,9 @@ bool OGLStagingTexture::Map()
+@@ -629,6 +757,9 @@ bool OGLStagingTexture::Map()
  {
    if (m_map_pointer)
      return true;
@@ -3599,7 +3731,7 @@ index 003a7ec..fa23168 100644
  
    // Slow path, map the texture, unmap it later.
    GLenum flags;
-@@ -649,6 +777,9 @@ void OGLStagingTexture::Unmap()
+@@ -649,6 +780,9 @@ void OGLStagingTexture::Unmap()
    // No-op with persistent mapped buffers.
    if (!m_map_pointer || UsePersistentStagingBuffers())
      return;
@@ -3609,6 +3741,52 @@ index 003a7ec..fa23168 100644
  
    glBindBuffer(m_target, m_buffer_name);
    glUnmapBuffer(m_target);
+diff --git a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
+index 1dfd026..fc98897 100644
+--- a/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
++++ b/Source/Core/VideoBackends/OGL/ProgramShaderCache.cpp
+@@ -93,6 +93,7 @@ void SHADER::SetProgramVariables()
+ 
+   // To set uniform blocks/uniforms, the program must be active. We restore the
+   // current binding at the end of this method to maintain the invariant.
++  WEBGL_STAT(program_binds, 1);
+   glUseProgram(glprogid);
+ 
+   // Bind UBO and texture samplers
+@@ -167,7 +168,8 @@ void SHADER::Bind() const
+   if (CurrentProgram != glprogid)
+   {
+     INCSTAT(g_stats.this_frame.num_shader_changes);
+-    glUseProgram(glprogid);
++    WEBGL_STAT(program_binds, 1);
++  glUseProgram(glprogid);
+     CurrentProgram = glprogid;
+   }
+ }
+@@ -312,6 +314,7 @@ bool ProgramShaderCache::CompileComputeShader(SHADER& shader, std::string_view c
+   glAttachShader(shader.glprogid, shader_id);
+   shader.SetProgramBindings(true);
+   glLinkProgram(shader.glprogid);
++  WEBGL_STAT(program_links, 1);
+ 
+   // original shaders aren't needed any more
+   glDeleteShader(shader_id);
+@@ -342,6 +345,7 @@ GLuint ProgramShaderCache::CompileSingleShader(GLenum type, std::string_view cod
+ 
+   glShaderSource(result, num_strings, src.data(), src_sizes.data());
+   glCompileShader(result);
++  WEBGL_STAT(shader_compiles, 1);
+ 
+   if (!CheckShaderCompileResult(result, type, code))
+   {
+@@ -621,6 +625,7 @@ PipelineProgram* ProgramShaderCache::GetPipelineProgram(const GLVertexFormat* ve
+     // Link program.
+     prog->shader.SetProgramBindings(false);
+     glLinkProgram(prog->shader.glprogid);
++    WEBGL_STAT(program_links, 1);
+ 
+     // Restore VAO binding after linking.
+     if (!s_is_shared_context && vao != s_last_VAO)
 diff --git a/Source/Core/VideoCommon/DriverDetails.cpp b/Source/Core/VideoCommon/DriverDetails.cpp
 index deb005b..65a1ea1 100644
 --- a/Source/Core/VideoCommon/DriverDetails.cpp
@@ -3622,6 +3800,29 @@ index deb005b..65a1ea1 100644
  constexpr u32 m_os = OS_ALL;
  #endif
  
+diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
+index ed07589..bf837d3 100644
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "VideoCommon/TextureCacheBase.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include "Common/GL/GLUtil.h"
++#endif
++
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+@@ -2163,6 +2167,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+     float gamma, bool clamp_top, bool clamp_bottom,
+     const CopyFilterCoefficients::Values& filter_coefficients)
+ {
++  WEBGL_STAT(efb_copies, 1);
+   // Emulation methods:
+   //
+   // - EFB to RAM:
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
 index ecdaf5e..ed60ca5 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp

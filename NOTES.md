@@ -178,6 +178,20 @@ Framebuffer and active Texture"). Dolphin leaves stale bindings (e.g. a texture-
 later renders into). On Emscripten, `OGLGfx::Draw`/`DrawIndexed` call `BreakFeedbackLoops()`, which
 unbinds such textures first. Seen as a black screen after the Mario Superstar Baseball main menu.
 
+### Profiling a real game (2026-11-27, Mario Superstar Baseball, RTX 3060, Chrome 158)
+
+Chrome Performance trace: the page's main thread (CPU emulation + Dolphin's GL calls) was busy
+35%; Chrome's GPU process main thread was busy 96%. `retro_run` took ~8.5 ms but ran only ~12
+times a second: the page waits for the GPU process to finish frames. So the bottleneck is the
+cost of Dolphin's WebGL command stream in the GPU process (ANGLE/D3D11), not the PowerPC side.
+
+Counters to find out which part: `Module.dolphinGLStats()` returns running totals (draws, buffer
+uploads/KB, texture uploads/KB, shader compiles, program links, readbacks, EFB copies, texture
+and program binds, flushes); the website overlay shows them per second.
+`globalThis.DOLPHIN_GL_STREAM = 1` switches vertex/index/uniform uploads from glBufferSubData
+into one buffer (WebGL has no base vertex, so Dolphin rewrites from offset 0 every flush) to
+glBufferData orphaning, for A/B tests.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.

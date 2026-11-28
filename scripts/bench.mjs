@@ -22,6 +22,7 @@ for (;;) {
     await p.screenshot({ path: `/home/claude/out/bench-m${mode}.png` });
     const jit = await p.evaluate(() => (window.EJS_emulator.Module.wasmJitBlocks || 0) + ' fallbacks ' + JSON.stringify(window.EJS_emulator.Module.wasmJitFallbacks));
     console.log(`mode ${mode}: ${fps} core fps (frames ${f0}->${f}), compiled blocks ${jit}`);
+    console.log('gl', await p.evaluate(() => JSON.stringify(window.EJS_emulator.Module.dolphinGLStats?.())));
     break;
   }
 }
