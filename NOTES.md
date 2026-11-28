@@ -253,7 +253,10 @@ per draw, ~800 draws a frame in Mario Superstar Baseball gameplay, which saturat
 process. On Emscripten the constants live in one persistent UBO that stays bound; only the dirty
 sections (pixel / vertex / geometry) are uploaded with glBufferSubData. Utility uniforms (which
 bind the stream buffer) mark it for re-binding; custom pixel constants use the old path.
-Menu FIFO: 130 -> 50 KB of buffer uploads per frame, same picture. `DOLPHIN_GL_UBO_PARTIAL=0`
+Dirty sections are then compared with a shadow copy of the buffer and only changed spans
+(16-byte grain, merged across gaps < 256 bytes) are uploaded. Menu FIFO: buffer uploads
+130 -> 50 (sections) -> 9.5 KB per frame (diff), same picture. Real games: Mario Superstar
+Baseball gameplay 41% -> ~60% speed, TTYD 34% -> 41% (sections only). `DOLPHIN_GL_UBO_PARTIAL=0`
 reverts.
 
 ## Known issues / TODO (rough priority)
