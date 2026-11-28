@@ -245,6 +245,17 @@ npc != fall-through; inline in wasm, flushing registers but keeping them for the
 followed `b`/`bl` don't end the block, and the callee's `blr` is skipped by the analyzer.
 fpbench: 34 -> 39 fps, 138 -> 65 blocks, same checksum. `DOLPHIN_WASM_JIT_LONGBLOCKS=0` reverts.
 
+### GX constants upload (per-draw cost)
+
+ProgramShaderCache::UploadConstants re-uploaded all GX constants (~6.6 KB: pixel + vertex +
+geometry) through the stream buffer and re-bound 4 UBO ranges whenever anything changed: once
+per draw, ~800 draws a frame in Mario Superstar Baseball gameplay, which saturated Chrome's GPU
+process. On Emscripten the constants live in one persistent UBO that stays bound; only the dirty
+sections (pixel / vertex / geometry) are uploaded with glBufferSubData. Utility uniforms (which
+bind the stream buffer) mark it for re-binding; custom pixel constants use the old path.
+Menu FIFO: 130 -> 50 KB of buffer uploads per frame, same picture. `DOLPHIN_GL_UBO_PARTIAL=0`
+reverts.
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
