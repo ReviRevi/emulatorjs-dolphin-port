@@ -6057,10 +6057,10 @@ index 0000000..e06e750
 +}  // namespace WGPU
 diff --git a/Source/Core/VideoBackends/WebGPU/WGPURuntime.js b/Source/Core/VideoBackends/WebGPU/WGPURuntime.js
 new file mode 100644
-index 0000000..07370f3
+index 0000000..f60e28f
 --- /dev/null
 +++ b/Source/Core/VideoBackends/WebGPU/WGPURuntime.js
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,703 @@
 +// WebGPU backend runtime for Dolphin (browser side). Evaluated once with `env`:
 +//   env.heap()  -> current HEAPU8      env.gl() -> current WebGL context (RetroArch's)
 +//   env.GL      -> Emscripten GL object tables    env.str(ptr) -> UTF8ToString
@@ -6130,13 +6130,14 @@ index 0000000..07370f3
 +var slots = [], samplers = [], samplerCache = new Map();
 +var vbuf, ibuf, ubuf, bgl0, bg0, dummy, VSIZE = 32 << 20, ISIZE = 8 << 20, USIZE = 8 << 20, UBIND = 16384;
 +var vpos = 0, ipos = 0, upos = 0, gxOff = [0, 0, 0], utilOff = 0;
-+var stats = W.stats = { draws: 0, passes: 0, submits: 0, pipelines: 0, shaders: 0, shaderFails: 0, uploads: 0 };
++var stats = W.stats = { bufWrites: 0, directUploads: 0, draws: 0, passes: 0, submits: 0, pipelines: 0, shaders: 0, shaderFails: 0, uploads: 0 };
 +
 +function setup() {
 +  var U = GPUBufferUsage;
 +  vbuf = dev.createBuffer({ size: VSIZE, usage: U.VERTEX | U.COPY_DST });
 +  ibuf = dev.createBuffer({ size: ISIZE, usage: U.INDEX | U.COPY_DST });
 +  ubuf = dev.createBuffer({ size: USIZE, usage: U.UNIFORM | U.COPY_DST });
++  vStage = new Uint8Array(VSIZE); iStage = new Uint8Array(ISIZE); uStage = new Uint8Array(USIZE);
 +  var vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
 +  var e = [];
 +  for (var i = 0; i < 3; i++) e.push({ binding: i, visibility: vis, buffer: { type: 'uniform', hasDynamicOffset: true } });
@@ -6149,9 +6150,21 @@ index 0000000..07370f3
 +
 +function enc() { if (!encoder) encoder = dev.createCommandEncoder(); return encoder; }
 +function endPass() { if (pass) { pass.end(); pass = null; } }
++// Vertex, index and uniform data is staged in JS mirrors of the GPU ring buffers
++// and written with one writeBuffer per buffer just before each submit (instead
++// of one per draw). Draws only reference ring offsets, so this is equivalent.
++var vStage, iStage, uStage, vLo = 1e9, vHi = 0, iLo = 1e9, iHi = 0, uLo = 1e9, uHi = 0, encEpoch = 1;
++function flushStage() {
++  if (vHi > vLo) { queue.writeBuffer(vbuf, vLo, vStage, vLo, vHi - vLo); stats.bufWrites++; }
++  if (iHi > iLo) { queue.writeBuffer(ibuf, iLo, iStage, iLo, iHi - iLo); stats.bufWrites++; }
++  if (uHi > uLo) { queue.writeBuffer(ubuf, uLo, uStage, uLo, uHi - uLo); stats.bufWrites++; }
++  vLo = iLo = uLo = 1e9; vHi = iHi = uHi = 0;
++}
 +function submit() {
 +  endPass();
++  flushStage();
 +  if (encoder) { queue.submit([encoder.finish()]); encoder = null; stats.submits++; }
++  encEpoch++;
 +  for (var i = 0; i < trash.length; i++) trash[i].destroy();
 +  trash = [];
 +}
@@ -6197,6 +6210,7 @@ index 0000000..07370f3
 +  }
 +  buf.unmap();
 +  endPass();
++  o.ep = encEpoch;
 +  enc().copyBufferToTexture({ buffer: buf, bytesPerRow: bpr, rowsPerImage: rows },
 +                            { texture: o.t, mipLevel: level, origin: [x, y, layer] }, [w, h, 1]);
 +  trash.push(buf);
@@ -6211,6 +6225,17 @@ index 0000000..07370f3
 +  else { rowBytes = rowLength * f.bytes; rows = h; }
 +  var mw = Math.max(1, o.w >> level), mh = Math.max(1, o.h >> level);
 +  if (f.block) { w = Math.min(align(w, 4), align(mw, 4)); h = Math.min(align(h, 4), align(mh, 4)); }
++  // Not referenced by the commands recorded since the last submit: write it
++  // through the queue, which doesn't interrupt the render pass. Otherwise copy
++  // inside the command stream so earlier draws still see the old contents.
++  var lastRow = f.block ? Math.ceil(w / 4) * f.bytes : w * f.bytes;
++  if (o.ep !== encEpoch && size >= rowBytes * (rows - 1) + lastRow) {
++    queue.writeTexture({ texture: o.t, mipLevel: level, origin: [x, y, layer] }, H().subarray(ptr, ptr + size),
++                       { bytesPerRow: rowBytes, rowsPerImage: rows }, [w, h, 1]);
++    stats.directUploads++;
++    if (f.depth) o.shadowDirty = true;
++    return;
++  }
 +  uploadBytes(o, level, layer, x, y, w, h, H().subarray(ptr, ptr + size), rowBytes, rows);
 +  if (f.depth) o.shadowDirty = true;
 +};
@@ -6218,6 +6243,7 @@ index 0000000..07370f3
 +  var a = O[src], b = O[dst];
 +  if (!a || !b) return;
 +  endPass();
++  a.ep = b.ep = encEpoch;
 +  enc().copyTextureToTexture({ texture: a.t, mipLevel: slev, origin: [sx, sy, sl] },
 +                             { texture: b.t, mipLevel: dlev, origin: [dx, dy, dl] }, [w, h, 1]);
 +  if (b.f.depth) b.shadowDirty = true;
@@ -6283,11 +6309,12 @@ index 0000000..07370f3
 +  if (!fb) return false;
 +  var pc = pendingClear;
 +  pendingClear = null;
-+  var att = function(o) { return { view: view(o, 'rt'), loadOp: pc ? 'clear' : 'load', clearValue: pc ? pc.c : [0, 0, 0, 0], storeOp: 'store' }; };
++  var att = function(o) { o.ep = encEpoch; return { view: view(o, 'rt'), loadOp: pc ? 'clear' : 'load', clearValue: pc ? pc.c : [0, 0, 0, 0], storeOp: 'store' }; };
 +  var desc = { colorAttachments: [] };
 +  if (fb.color) desc.colorAttachments.push(att(fb.color));
 +  fb.adds.forEach(function(o) { desc.colorAttachments.push(att(o)); });
 +  if (fb.depth) {
++    fb.depth.ep = encEpoch;
 +    var dd = { view: view(fb.depth, 'rt'), depthLoadOp: pc ? 'clear' : 'load', depthClearValue: pc ? pc.d : 1, depthStoreOp: 'store' };
 +    if (fb.depth.f.stencil) { dd.stencilLoadOp = pc ? 'clear' : 'load'; dd.stencilClearValue = 0; dd.stencilStoreOp = 'store'; }
 +    desc.depthStencilAttachment = dd;
@@ -6529,6 +6556,7 @@ index 0000000..07370f3
 +      var o = slots[slot] || dummy, fb = O[curFb];
 +      // a texture can't be sampled while it's an attachment of this pass
 +      if (fb && (o === fb.color || o === fb.depth || fb.adds.indexOf(o) >= 0)) o = dummy;
++      o.ep = encEpoch;
 +      if (o.f.depth) o = shadowOf(o);
 +      var dim = e.texture.viewDimension === '2d' ? '2d' : 'arr';
 +      r = view(o, dim);
@@ -6552,23 +6580,29 @@ index 0000000..07370f3
 +  var a = stride % 4 ? stride * 4 : stride;
 +  var off = align(vpos, a), sz = align(size, 4);
 +  if (off + sz > VSIZE) { ringWrap(); off = 0; }
-+  queue.writeBuffer(vbuf, off, H(), ptr, sz);
++  vStage.set(H().subarray(ptr, ptr + size), off);
++  if (off < vLo) vLo = off;
 +  vpos = off + sz;
++  if (vpos > vHi) vHi = vpos;
 +  return stride ? off / stride : 0;
 +};
 +W.indices = function(ptr, count) {
 +  var off = align(ipos, 4), sz = align(count * 2, 4);
 +  if (off + sz > ISIZE) { ringWrap(); off = 0; }
-+  queue.writeBuffer(ibuf, off, H(), ptr, sz);
++  iStage.set(H().subarray(ptr, ptr + count * 2), off);
++  if (off < iLo) iLo = off;
 +  ipos = off + sz;
++  if (ipos > iHi) iHi = ipos;
 +  return off / 2;
 +};
 +// slot 0 PS, 1 VS, 2 GS, 3 utility
 +W.uniforms = function(slot, ptr, size) {
 +  var off = align(upos, 256);
 +  if (off + UBIND > USIZE) { ringWrap(); off = 0; }
-+  queue.writeBuffer(ubuf, off, H(), ptr, align(size, 4));
++  uStage.set(H().subarray(ptr, ptr + size), off);
++  if (off < uLo) uLo = off;
 +  upos = off + align(size, 4);
++  if (upos > uHi) uHi = upos;
 +  if (slot === 3) utilOff = off; else gxOff[slot] = off;
 +  dBG0 = true;
 +};
@@ -6612,6 +6646,7 @@ index 0000000..07370f3
 +  var s = O[sid], o = O[tid];
 +  if (!s || !o) return;
 +  if (o.fmt === 10) return;  // depth24plus can't be copied out
++  o.ep = encEpoch;
 +  var bpt = o.f.bytes, bpr = align(w * bpt, 256);
 +  var buf = dev.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 +  endPass();

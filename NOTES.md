@@ -323,6 +323,11 @@ WebGPU and copies each finished frame into RetroArch's GL framebuffer.
   pass's loadOp (as Metal); copies and uploads end the pass. Uploads go through mapped staging
   buffers inside the command encoder so they stay ordered with draws. Destroyed objects are kept
   until the next submit.
+- **Batched uploads.** Vertex, index and uniform data is copied into JS mirrors of the GPU ring
+  buffers and written with one writeBuffer per buffer just before each submit (menu FIFO: 3 writes
+  per frame instead of one per draw per buffer). Texture uploads go through queue.writeTexture,
+  which doesn't end the render pass, unless the texture is already referenced by commands recorded
+  since the last submit (tracked per texture); then they're copied inside the command stream.
 - **Readbacks** are asynchronous: StagingTexture::Map returns whatever has arrived (usually the
   previous frame's data) instead of stalling.
 - **Present.** Default: copy the backbuffer to a mappable buffer, texImage2D it into a GL texture
