@@ -358,6 +358,16 @@ does), and `FastCheckGatherPipe` is called once the pipe holds 32 bytes. Covers 
 stfs/stfd/stfiwx and float psq_st (quantized psq_st still falls back). fpbench checksum unchanged.
 `relink.sh` now links with `--profiling-funcs` so browser traces show function names.
 
+### Pointers above 2 GB in JS glue
+
+The heap is ~2.3 GB, so wasm pointers can be >= 0x80000000. Passed to EM_JS as `int`/pointer
+they arrive in JS as negative numbers, and `HEAPU8.slice(p, ...)` / `subarray` then count from
+the end of memory. Symptom (2026-11-28, WebGPU build, which allocates more): JIT blocks failed
+with "expected magic 00 61 73 6d, found 00 00 00 00" and stayed interpreted (team select 30%,
+gameplay ~10%), and WebGPU texture/vertex uploads read the wrong memory (garbage overlay in
+gameplay). Every EM_JS that takes a pointer now does `p >>> 0` (JIT install, all wgpu_* stubs,
+UTF8ToString calls, GL stats).
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
