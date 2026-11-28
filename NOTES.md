@@ -292,6 +292,135 @@ useProgram, bindTexture/bindSampler and uniform-buffer range rebinds. `DOLPHIN_G
 Remaining per-draw calls: one constants upload (bufferSubData) per changed section, texture binds,
 blend state. Versioning the constants buffer would only trade bufferSubData for bindBufferRange.
 
+## WebGPU backend (branch `webgpu`, experimental)
+
+`Source/Core/VideoBackends/WebGPU`: a new Dolphin video backend for the browser build, on with
+`DOLPHIN_WEBGPU=1` (jl-emu-globals). RetroArch still gets a WebGL context; the core renders with
+WebGPU and copies each finished frame into RetroArch's GL framebuffer.
+
+- **Split C++/JS.** `WGPUBackend.cpp` implements Dolphin's abstract renderer (textures, staging
+  textures, framebuffers, shaders, pipelines, vertex formats, Gfx, VertexManager) as thin handles;
+  `WGPURuntime.js` does the WebGPU work through small EM_JS stubs (no webgpu.h, so no Emscripten
+  upgrade). `scripts/gen_wgpu_embed.py` embeds the runtime and naga into `WGPUEmbedded.inc`
+  (generated, not in the patch; build.sh runs it).
+- **Device.** Requested at module start (`AutoKick` static initializer) because it's asynchronous;
+  by the time a game boots it's ready. Optional features used if present: dual-source-blending,
+  float32-filterable, texture-compression-bc, depth32float-stencil8.
+- **Shaders.** Dolphin generates Metal-style GLSL 4.5 (api_type Metal: same NDC/depth/origin
+  conventions as WebGPU). glslang preprocesses it (`SPIRV::PreprocessShader`), then JS rewrites
+  what WGSL can't express and naga (npm `naga-wasm`, 2 MB wasm, embedded) translates to WGSL:
+  combined image-samplers split into texture (binding 2n) + sampler (2n+1), including function
+  parameters; `bool` uniform-block members become uint; `isnan()` expanded; a lone `index = 0`
+  output loses its index. WGSL gets `diagnostic(off, derivative_uniformity)` because Dolphin samples
+  inside non-uniform branches. Dynamic sampler indexing, geometry/compute shaders, palette
+  conversion, logic ops, bbox, depth clamp, large points are reported unsupported.
+- **Binding.** Group 0: one uniform ring buffer bound three times with dynamic offsets (PS, VS, GS;
+  utility pipelines read the utility block at all three). Group 1: textures/samplers, layout taken
+  from the WGSL's declared bindings; bind groups cached per pipeline. A texture that's an attachment
+  of the current pass is replaced with a dummy (the EFB stays bound to unused samplers). Depth
+  textures are sampled through an r32float copy made with copyTextureToBuffer.
+- **Passes.** Begun lazily on the first draw after SetFramebuffer; whole-target clears become the
+  pass's loadOp (as Metal); copies and uploads end the pass. Uploads go through mapped staging
+  buffers inside the command encoder so they stay ordered with draws. Destroyed objects are kept
+  until the next submit.
+- **Batched uploads.** Vertex, index and uniform data is copied into JS mirrors of the GPU ring
+  buffers and written with one writeBuffer per buffer just before each submit (menu FIFO: 3 writes
+  per frame instead of one per draw per buffer). Texture uploads go through queue.writeTexture,
+  which doesn't end the render pass, unless the texture is already referenced by commands recorded
+  since the last submit (tracked per texture); then they're copied inside the command stream.
+- **Readbacks** are asynchronous: StagingTexture::Map returns whatever has arrived (usually the
+  previous frame's data) instead of stalling.
+- **Present.** Default: copy the backbuffer to a mappable buffer, texImage2D it into a GL texture
+  when the map completes, blit into RetroArch's framebuffer (a frame or two of latency).
+  `DOLPHIN_WEBGPU_PRESENT=1` tries the GPU-only route (copy to a WebGPU canvas, texImage2D from
+  the canvas); in headless SwiftShader the canvas snapshot came back blank, untested on real GPUs.
+- **Testing.** Headless Chrome runs WebGPU on SwiftShader (`--enable-unsafe-webgpu
+  --use-webgpu-adapter=swiftshader --enable-features=Vulkan`), but WebGPU canvases don't show in
+  screenshots: read textures back with `Module.__wgpu._list()` / `_read(id)` (scripts/tex2png.py).
+  `Module.__wgpu.stats` counts draws, passes, submits, shader failures. `scripts/xlat.mjs` runs the
+  GLSL->WGSL path in node on dumped shaders. Menu FIFO: all 26 shaders translate, no validation
+  errors, picture matches the WebGL build.
+- **Known gaps.** Viewports are clamped to the target (WebGPU requires it), which distorts
+  geometry when a game's viewport extends off-screen; no MSAA; R16 textures map to r16float;
+  D24S8 depth can't be read back or sampled; ~7 draws per render pass on the menu (uploads and
+  copies end passes).
+
+### Gather pipe stores in the JIT
+
+Baseball trace on the WebGPU build (2026-11-28): main thread ~96% busy; ~71% CPU emulation
+(37.5% compiled PowerPC code, 15.4% Interpreter fallbacks, 12.3% the CachedInterpreter dispatch
+loop), ~22% GPU side (10.8% WebGPU JS calls). The fallbacks were mostly `stw`/`stb` (and FP
+stores) to 0xCC008000: games feed the GPU by storing to the write-gather pipe, which isn't RAM, so
+those stores took the Interpreter -> MMU::WriteToHardware -> GPFifo path. Compiled stores now
+check for the gather pipe page first (EA 0xCC008000 with MSR.DR, 0x0C008000 without; non-update
+forms): the value is written big-endian at `ppcState.gather_pipe_ptr` (what GPFifoManager::FastWrite*
+does), and `FastCheckGatherPipe` is called once the pipe holds 32 bytes. Covers stb/sth/stw(x),
+stfs/stfd/stfiwx and float psq_st (quantized psq_st still falls back). fpbench checksum unchanged.
+`relink.sh` now links with `--profiling-funcs` so browser traces show function names.
+
+### Pointers above 2 GB in JS glue
+
+The heap is ~2.3 GB, so wasm pointers can be >= 0x80000000. Passed to EM_JS as `int`/pointer
+they arrive in JS as negative numbers, and `HEAPU8.slice(p, ...)` / `subarray` then count from
+the end of memory. Symptom (2026-11-28, WebGPU build, which allocates more): JIT blocks failed
+with "expected magic 00 61 73 6d, found 00 00 00 00" and stayed interpreted (team select 30%,
+gameplay ~10%), and WebGPU texture/vertex uploads read the wrong memory (garbage overlay in
+gameplay). Every EM_JS that takes a pointer now does `p >>> 0` (JIT install, all wgpu_* stubs,
+UTF8ToString calls, GL stats).
+
+### RAM fast path for compiled loads/stores
+
+Trace after the 2 GB fix (baseball gameplay, steady state): compiled PowerPC code 61-65% of the
+main thread, GPU side 21-26%, dispatcher 3-4%, Interpreter ~0 (the 12% dispatcher in earlier
+traces was warm-up). `Emitter::Translate` now starts with a fast path when, at compile time, the
+DBAT table maps 0x80000000 + [0, RAM size) to physical RAM, cached, and data cache emulation is
+off (`fast_ram`): `ea - 0x80000000 <= ram_size - size` -> host = ram + offset, skipping the BAT
+table load, the dcache flag load, the page-crossing check and the RAM-range masking. Anything else
+falls through to the old path. Safe because MMU::DBATUpdated clears the JIT cache. fpbench
+checksum unchanged.
+
+### Forward branches inside a compiled block
+
+TTYD gameplay trace (2026-11-28): ~24% of the main thread in five 6-instruction blocks at
+0x8014505c..0x801450c8 - one loop (64 iterations x 4 checks of a flag bit, collecting active
+entries) where each `beq` skips 3 instructions. A taken conditional branch left the block
+(EndBlockIfTaken), so every iteration crossed up to 5 block boundaries. Now, when the target of a
+forward `bc` (no link) is a later instruction of the same block reached in straight-line order
+(no followed branches or block ends in between) and properly nested inside any open region, the
+taken path is a `br_if` out of a wasm `block` that ends right before the target. Registers:
+dirty ones are flushed (kept dirty) before the branch, so memory is right on the taken path; at
+the join only registers loaded on both paths stay loaded, and ones first loaded and modified
+inside are written back at the end of the fall-through path. Skipped instructions' cycles still
+count against the downcount (slight over-count). `DOLPHIN_WASM_JIT_FWDBRANCH=0` disables it.
+Test: `test-content/brtest` (a copy of the TTYD loop plus nested forward branches): same checksum
+with and without, loop 35.4 -> 43.9 fps headless; fpbench checksum unchanged.
+
+### Dual core (experimental, `DOLPHIN_DUALCORE=1`)
+
+Single core was forced because dual core blocks the main thread waiting for worker threads while
+workers' filesystem calls are proxied to the main thread. With the flag, Boot.cpp leaves
+MAIN_CPU_THREAD on: the CPU runs in a pthread (web worker) and retro_run does the libretro dual
+core frame (DoFrameStep, then RunGpuLoop on the main thread until the CPU thread's StopGpuLoop),
+so the GPU side (FIFO decode, vertex loading, WebGPU/WebGL) overlaps the CPU within each frame.
+Emscripten's main-thread waits spin while processing proxied calls, so the boot-time file reads
+from the CPU thread went through. Fix needed: audio (SYNC_PER_FRAME) is pushed from the CPU
+thread, but RetroArch's audio driver (RWebAudio*) is JS bound to the main thread ("Cannot read
+properties of null (reading 'sampleRate')" in the worker) - samples produced off the main thread
+are queued and handed to batch_cb at the end of retro_run (`Audio::DrainPendingAudio`).
+That crackled: a frame's samples arriving just after the hand-off waited a frame (bursts of two,
+then none). Now in dual core the CPU thread's NewField skips the push and retro_run mixes one
+frame's worth (`Stream::PushAudioForFrame`) on the main thread after each frame.
+The JIT compiles and runs blocks on the CPU thread (its own function table), so
+`Module.wasmJitBlocks` / failures are counted on the worker's Module: the overlay's `jit` line
+reads 0 in dual core. Headless: fpbench and brtest checksums match single core (WebGL and WebGPU).
+Each thread has its own wasm function table: the first real dual-core boot died with
+"WebAssembly.Table.set(): invalid" when a block compiled on the CPU thread was destroyed from the
+main thread. `dolphin_wasm_jit_install` now records the slots it fills (`Module.__wasmJitOwn`, per
+thread) and `dolphin_wasm_jit_free` only frees those; a slot owned by another thread is left
+allocated there (the block's entry.fn is cleared, so it's never called).
+First real test (baseball, actually still single core - the flag wasn't set): stadium load 82-84% (vs ~60%), gameplay unchanged at 50-60% - the
+threads don't overlap much in gameplay yet; needs a dual-core trace (main vs worker timelines).
+
 ## Known issues / TODO (rough priority)
 
 1. **Test real games** (user-supplied). Watch the console for `[libretro ERROR]` and aborts.
@@ -322,3 +451,49 @@ the Ubuntu bzip2 1.0.8 source. On a normal machine `scripts/setup.sh` (emsdk) av
 `clang --target=powerpc-unknown-eabi -mcpu=750`, linked at 0x80003100, converted with
 `elf2dol.py`. Sets VI for 480i and fills the XFB with moving bars. Its VI/YUV setup is
 approximate (bars are not perfectly placed) — it exists only to prove CPU + VI + XFB work.
+
+### Dual core: page freeze around save states (fixed)
+
+The site autosaves every 30 s. A save pauses the CPU and the GPU loop's
+"emulator running" flag; on the next `retro_run` the main thread entered
+`RunGpuLoop()` and returned early every pass ("do nothing while paused")
+while waiting for the CPU thread's end-of-frame `StopGpuLoop`, which never
+came. The browser's main thread was stuck, so the tab couldn't even reload.
+Fix: on emscripten the GPU loop now ends as soon as the CPU thread is parked
+(stepping and idle), checked before the paused early return; after each
+frame `RunGpuLoopUntilCPUIdle(50)` services any GPU work the CPU queued
+between its frame-end signal and parking. Headless test: 30 back-to-back
+saves in dual core with no hang; fpbench/brtest checksums unchanged.
+
+### Dual core: main thread never blocks on the CPU thread without servicing the GPU
+
+`CPUManager::PauseAndLock` and `SetStepping(true)` wait for the CPU thread to
+go idle. In the browser the GPU work only runs when the main thread runs the
+GPU loop, so if the CPU thread was itself waiting on the GPU (EFB peek, full
+FIFO, swap) that wait deadlocked and froze the tab. On emscripten, in dual
+core, on the main thread, the wait now runs the GPU loop in 2 ms slices
+(`WaitForCPUThreadIdle`). Not reproduced headless; written for reports of
+Gauntlet freezing at boot in dual core.
+
+### Dual core: drain the GPU FIFO at the end of each frame (tried, reverted)
+
+Smear and the Wind Waker post-cutscene crash appear only in dual core. The CPU
+thread pauses as soon as it ends a frame, often far ahead of the GPU, and the
+paused GPU loop skipped the rest of the FIFO ("do nothing while paused"). The
+next frame's CPU work then overwrote textures and vertex data the GPU hadn't
+read yet. `RunGpuLoopUntilCPUIdle` (after each frame, 200 ms cap) now keeps
+processing the FIFO while paused and only stops once the CPU is parked and
+the FIFO is drained (`IsGpuFifoDrained`).
+
+Reverted: the smear stayed and Paper Mario fell from ~80% to ~60%.
+
+### Dual core: WebGPU calls from other threads are proxied to the main thread
+
+The WebGPU device and every object the backend made live in the browser's
+main thread; a call from the CPU thread would find no `Module.__wgpu` there
+and throw (an uncaught worker error shows as "Uncaught [object ErrorEvent]",
+like the Wind Waker crash after a few minutes in dual core). Each backend
+EM_JS call now checks the thread; off the main thread it runs synchronously
+on the main thread (emscripten system proxying queue) and logs
+`[wgpu] call from a non-main thread, proxied: <name>` with a stack trace,
+once per function. Headless test programs log none.
