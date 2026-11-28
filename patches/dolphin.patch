@@ -4700,7 +4700,7 @@ index 159e6a6..361c500 100644
    Boot.cpp
    Host.cpp
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
-index 97ba667..477b827 100644
+index 97ba667..b3d9fb0 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp
 +++ b/Source/Core/DolphinLibretro/Main.cpp
 @@ -1,4 +1,8 @@
@@ -4749,7 +4749,7 @@ index 97ba667..477b827 100644
 +    // thread is parked: otherwise a save state (the site saves every 30 s) or
 +    // anything that flushes the GPU from the main thread waits on work only the
 +    // main thread can run, and the page freezes.
-+    system.GetFifo().RunGpuLoopUntilCPUIdle(200);
++    system.GetFifo().RunGpuLoopUntilCPUIdle(50);
 +#endif
    }
    else
@@ -5806,10 +5806,10 @@ index 0000000..d0dff41
 +)
 diff --git a/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp b/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp
 new file mode 100644
-index 0000000..6a02ffe
+index 0000000..db6c192
 --- /dev/null
 +++ b/Source/Core/VideoBackends/WebGPU/WGPUBackend.cpp
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,997 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -5819,6 +5819,13 @@ index 0000000..6a02ffe
 +#include <cstring>
 +
 +#include <emscripten.h>
++#include <emscripten/proxying.h>
++#include <emscripten/threading.h>
++
++#include <mutex>
++#include <set>
++#include <string>
++#include <type_traits>
 +
 +#include "Common/GL/GLUtil.h"
 +#include "Common/Logging/Log.h"
@@ -5854,61 +5861,430 @@ index 0000000..6a02ffe
 +  Module.__wgpu = (new Function('env', UTF8ToString(runtime >>> 0)))(env);
 +  Module.__wgpu.kick();
 +});
-+EM_JS(int, wgpu_state, (), { return Module.__wgpu ? Module.__wgpu.state() : 0; });
-+EM_JS(int, wgpu_feature, (int i), { return Module.__wgpu.feature(i); });
-+EM_JS(int, wgpu_tex_create, (int w, int h, int layers, int levels, int fmt, int rt),
++EM_JS(int, wgpu_state_js, (), { return Module.__wgpu ? Module.__wgpu.state() : 0; });
++EM_JS(int, wgpu_feature_js, (int i), { return Module.__wgpu.feature(i); });
++EM_JS(int, wgpu_tex_create_js, (int w, int h, int layers, int levels, int fmt, int rt),
 +      { return Module.__wgpu.texCreate(w, h, layers, levels, fmt, rt); });
-+EM_JS(void, wgpu_tex_destroy, (int id), { Module.__wgpu.texDestroy(id); });
-+EM_JS(void, wgpu_tex_upload,
-+      (int id, int level, int layer, int x, int y, int w, int h, int row_length, const void* ptr,
++EM_JS(void, wgpu_tex_destroy_js, (int id), { Module.__wgpu.texDestroy(id); });
++EM_JS(void, wgpu_tex_upload_js, (int id, int level, int layer, int x, int y, int w, int h, int row_length, const void* ptr,
 +       int size),
 +      { Module.__wgpu.texUpload(id, level, layer, x, y, w, h, row_length, ptr >>> 0, size); });
-+EM_JS(void, wgpu_tex_copy,
-+      (int src, int sl, int slev, int sx, int sy, int dst, int dl, int dlev, int dx, int dy, int w,
++EM_JS(void, wgpu_tex_copy_js, (int src, int sl, int slev, int sx, int sy, int dst, int dl, int dlev, int dx, int dy, int w,
 +       int h),
 +      { Module.__wgpu.texCopy(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h); });
-+EM_JS(void, wgpu_set_texture, (int slot, int id), { Module.__wgpu.setTexture(slot, id); });
-+EM_JS(void, wgpu_set_sampler, (int slot, unsigned tm0, unsigned tm1),
++EM_JS(void, wgpu_set_texture_js, (int slot, int id), { Module.__wgpu.setTexture(slot, id); });
++EM_JS(void, wgpu_set_sampler_js, (int slot, unsigned tm0, unsigned tm1),
 +      { Module.__wgpu.setSampler(slot, tm0 >>> 0, tm1 >>> 0); });
-+EM_JS(int, wgpu_fb_create, (int color, int depth, const int* adds, int count),
++EM_JS(int, wgpu_fb_create_js, (int color, int depth, const int* adds, int count),
 +      { return Module.__wgpu.fbCreate(color, depth, adds >>> 0, count); });
-+EM_JS(void, wgpu_fb_destroy, (int id), { Module.__wgpu.fbDestroy(id); });
-+EM_JS(void, wgpu_set_framebuffer, (int id, int mode, float r, float g, float b, float a, float z),
++EM_JS(void, wgpu_fb_destroy_js, (int id), { Module.__wgpu.fbDestroy(id); });
++EM_JS(void, wgpu_set_framebuffer_js, (int id, int mode, float r, float g, float b, float a, float z),
 +      { Module.__wgpu.setFramebuffer(id, mode, r, g, b, a, z); });
-+EM_JS(void, wgpu_set_viewport, (float x, float y, float w, float h, float n, float f),
++EM_JS(void, wgpu_set_viewport_js, (float x, float y, float w, float h, float n, float f),
 +      { Module.__wgpu.setViewport(x, y, w, h, n, f); });
-+EM_JS(void, wgpu_set_scissor, (int x, int y, int w, int h),
++EM_JS(void, wgpu_set_scissor_js, (int x, int y, int w, int h),
 +      { Module.__wgpu.setScissor(x, y, w, h); });
-+EM_JS(int, wgpu_shader_create, (int stage, const char* src),
++EM_JS(int, wgpu_shader_create_js, (int stage, const char* src),
 +      { return Module.__wgpu.shaderCreate(stage, src >>> 0); });
-+EM_JS(void, wgpu_shader_destroy, (int id), { Module.__wgpu.shaderDestroy(id); });
-+EM_JS(int, wgpu_vfmt_create, (const int* desc), { return Module.__wgpu.vfmtCreate(desc >>> 0); });
-+EM_JS(int, wgpu_pipeline_create,
-+      (int vs, int fs, int vf, unsigned raster, unsigned depth, unsigned blend, unsigned fb,
++EM_JS(void, wgpu_shader_destroy_js, (int id), { Module.__wgpu.shaderDestroy(id); });
++EM_JS(int, wgpu_vfmt_create_js, (const int* desc), { return Module.__wgpu.vfmtCreate(desc >>> 0); });
++EM_JS(int, wgpu_pipeline_create_js, (int vs, int fs, int vf, unsigned raster, unsigned depth, unsigned blend, unsigned fb,
 +       int usage),
 +      {
 +        return Module.__wgpu.pipelineCreate(vs, fs, vf, raster >>> 0, depth >>> 0, blend >>> 0,
 +                                            fb >>> 0, usage);
 +      });
-+EM_JS(void, wgpu_pipeline_destroy, (int id), { Module.__wgpu.pipelineDestroy(id); });
-+EM_JS(void, wgpu_set_pipeline, (int id), { Module.__wgpu.setPipeline(id); });
-+EM_JS(int, wgpu_vertices, (const void* p, int size, int stride),
++EM_JS(void, wgpu_pipeline_destroy_js, (int id), { Module.__wgpu.pipelineDestroy(id); });
++EM_JS(void, wgpu_set_pipeline_js, (int id), { Module.__wgpu.setPipeline(id); });
++EM_JS(int, wgpu_vertices_js, (const void* p, int size, int stride),
 +      { return Module.__wgpu.vertices(p >>> 0, size, stride); });
-+EM_JS(int, wgpu_indices, (const void* p, int count), { return Module.__wgpu.indices(p >>> 0, count); });
-+EM_JS(void, wgpu_uniforms, (int slot, const void* p, int size),
++EM_JS(int, wgpu_indices_js, (const void* p, int count), { return Module.__wgpu.indices(p >>> 0, count); });
++EM_JS(void, wgpu_uniforms_js, (int slot, const void* p, int size),
 +      { Module.__wgpu.uniforms(slot, p >>> 0, size); });
-+EM_JS(void, wgpu_draw, (int base, int count), { Module.__wgpu.draw(base, count); });
-+EM_JS(void, wgpu_draw_indexed, (int bi, int count, int bv),
++EM_JS(void, wgpu_draw_js, (int base, int count), { Module.__wgpu.draw(base, count); });
++EM_JS(void, wgpu_draw_indexed_js, (int bi, int count, int bv),
 +      { Module.__wgpu.drawIndexed(bi, count, bv); });
-+EM_JS(int, wgpu_st_create, (), { return Module.__wgpu.stCreate(); });
-+EM_JS(void, wgpu_st_destroy, (int id), { Module.__wgpu.stDestroy(id); });
-+EM_JS(void, wgpu_st_copy_from,
-+      (int sid, int tid, int layer, int level, int sx, int sy, int w, int h, int off, int stride),
++EM_JS(int, wgpu_st_create_js, (), { return Module.__wgpu.stCreate(); });
++EM_JS(void, wgpu_st_destroy_js, (int id), { Module.__wgpu.stDestroy(id); });
++EM_JS(void, wgpu_st_copy_from_js, (int sid, int tid, int layer, int level, int sx, int sy, int w, int h, int off, int stride),
 +      { Module.__wgpu.stCopyFrom(sid, tid, layer, level, sx, sy, w, h, off, stride); });
-+EM_JS(void, wgpu_st_flush, (int id), { Module.__wgpu.stFlush(id); });
-+EM_JS(int, wgpu_st_read, (int id, void* p), { return Module.__wgpu.stRead(id, p >>> 0); });
-+EM_JS(void, wgpu_flush, (), { if (Module.__wgpu) Module.__wgpu.flush(); });
-+EM_JS(void, wgpu_present, (int tid, unsigned fbo), { Module.__wgpu.present(tid, fbo); });
++EM_JS(void, wgpu_st_flush_js, (int id), { Module.__wgpu.stFlush(id); });
++EM_JS(int, wgpu_st_read_js, (int id, void* p), { return Module.__wgpu.stRead(id, p >>> 0); });
++EM_JS(void, wgpu_flush_js, (), { if (Module.__wgpu) Module.__wgpu.flush(); });
++EM_JS(void, wgpu_present_js, (int tid, unsigned fbo), { Module.__wgpu.present(tid, fbo); });
++
++// Dual core: the WebGPU device and all its objects live in the browser's main
++// thread. A call from another thread (the CPU thread) would find no device
++// there and throw, so run it on the main thread instead, and say so once.
++template <typename F>
++static void WgpuProxySync(F&& f)
++{
++  emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(),
++                        [](void* a) { (*static_cast<std::remove_reference_t<F>*>(a))(); }, &f);
++}
++static void WgpuOffMain(const char* name)
++{
++  static std::mutex mtx;
++  static std::set<std::string> seen;
++  {
++    std::lock_guard lk(mtx);
++    if (!seen.insert(name).second)
++      return;
++  }
++  EM_ASM({ console.warn('[wgpu] call from a non-main thread, proxied: ' + UTF8ToString($0 >>> 0)); console.trace(); }, name);
++}
++
++static int wgpu_state()
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_state");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_state_js(); });
++    return r;
++  }
++  return wgpu_state_js();
++}
++
++static int wgpu_feature(int i)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_feature");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_feature_js(i); });
++    return r;
++  }
++  return wgpu_feature_js(i);
++}
++
++static int wgpu_tex_create(int w, int h, int layers, int levels, int fmt, int rt)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_tex_create");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_tex_create_js(w, h, layers, levels, fmt, rt); });
++    return r;
++  }
++  return wgpu_tex_create_js(w, h, layers, levels, fmt, rt);
++}
++
++static void wgpu_tex_destroy(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_tex_destroy");
++    WgpuProxySync([&] { wgpu_tex_destroy_js(id); });
++    return;
++  }
++  wgpu_tex_destroy_js(id);
++}
++
++static void wgpu_tex_upload(int id, int level, int layer, int x, int y, int w, int h, int row_length, const void* ptr, int size)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_tex_upload");
++    WgpuProxySync([&] { wgpu_tex_upload_js(id, level, layer, x, y, w, h, row_length, ptr, size); });
++    return;
++  }
++  wgpu_tex_upload_js(id, level, layer, x, y, w, h, row_length, ptr, size);
++}
++
++static void wgpu_tex_copy(int src, int sl, int slev, int sx, int sy, int dst, int dl, int dlev, int dx, int dy, int w, int h)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_tex_copy");
++    WgpuProxySync([&] { wgpu_tex_copy_js(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h); });
++    return;
++  }
++  wgpu_tex_copy_js(src, sl, slev, sx, sy, dst, dl, dlev, dx, dy, w, h);
++}
++
++static void wgpu_set_texture(int slot, int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_set_texture");
++    WgpuProxySync([&] { wgpu_set_texture_js(slot, id); });
++    return;
++  }
++  wgpu_set_texture_js(slot, id);
++}
++
++static void wgpu_set_sampler(int slot, unsigned tm0, unsigned tm1)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_set_sampler");
++    WgpuProxySync([&] { wgpu_set_sampler_js(slot, tm0, tm1); });
++    return;
++  }
++  wgpu_set_sampler_js(slot, tm0, tm1);
++}
++
++static int wgpu_fb_create(int color, int depth, const int* adds, int count)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_fb_create");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_fb_create_js(color, depth, adds, count); });
++    return r;
++  }
++  return wgpu_fb_create_js(color, depth, adds, count);
++}
++
++static void wgpu_fb_destroy(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_fb_destroy");
++    WgpuProxySync([&] { wgpu_fb_destroy_js(id); });
++    return;
++  }
++  wgpu_fb_destroy_js(id);
++}
++
++static void wgpu_set_framebuffer(int id, int mode, float r, float g, float b, float a, float z)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_set_framebuffer");
++    WgpuProxySync([&] { wgpu_set_framebuffer_js(id, mode, r, g, b, a, z); });
++    return;
++  }
++  wgpu_set_framebuffer_js(id, mode, r, g, b, a, z);
++}
++
++static void wgpu_set_viewport(float x, float y, float w, float h, float n, float f)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_set_viewport");
++    WgpuProxySync([&] { wgpu_set_viewport_js(x, y, w, h, n, f); });
++    return;
++  }
++  wgpu_set_viewport_js(x, y, w, h, n, f);
++}
++
++static void wgpu_set_scissor(int x, int y, int w, int h)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_set_scissor");
++    WgpuProxySync([&] { wgpu_set_scissor_js(x, y, w, h); });
++    return;
++  }
++  wgpu_set_scissor_js(x, y, w, h);
++}
++
++static int wgpu_shader_create(int stage, const char* src)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_shader_create");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_shader_create_js(stage, src); });
++    return r;
++  }
++  return wgpu_shader_create_js(stage, src);
++}
++
++static void wgpu_shader_destroy(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_shader_destroy");
++    WgpuProxySync([&] { wgpu_shader_destroy_js(id); });
++    return;
++  }
++  wgpu_shader_destroy_js(id);
++}
++
++static int wgpu_vfmt_create(const int* desc)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_vfmt_create");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_vfmt_create_js(desc); });
++    return r;
++  }
++  return wgpu_vfmt_create_js(desc);
++}
++
++static int wgpu_pipeline_create(int vs, int fs, int vf, unsigned raster, unsigned depth, unsigned blend, unsigned fb, int usage)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_pipeline_create");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_pipeline_create_js(vs, fs, vf, raster, depth, blend, fb, usage); });
++    return r;
++  }
++  return wgpu_pipeline_create_js(vs, fs, vf, raster, depth, blend, fb, usage);
++}
++
++static void wgpu_pipeline_destroy(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_pipeline_destroy");
++    WgpuProxySync([&] { wgpu_pipeline_destroy_js(id); });
++    return;
++  }
++  wgpu_pipeline_destroy_js(id);
++}
++
++static void wgpu_set_pipeline(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_set_pipeline");
++    WgpuProxySync([&] { wgpu_set_pipeline_js(id); });
++    return;
++  }
++  wgpu_set_pipeline_js(id);
++}
++
++static int wgpu_vertices(const void* p, int size, int stride)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_vertices");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_vertices_js(p, size, stride); });
++    return r;
++  }
++  return wgpu_vertices_js(p, size, stride);
++}
++
++static int wgpu_indices(const void* p, int count)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_indices");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_indices_js(p, count); });
++    return r;
++  }
++  return wgpu_indices_js(p, count);
++}
++
++static void wgpu_uniforms(int slot, const void* p, int size)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_uniforms");
++    WgpuProxySync([&] { wgpu_uniforms_js(slot, p, size); });
++    return;
++  }
++  wgpu_uniforms_js(slot, p, size);
++}
++
++static void wgpu_draw(int base, int count)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_draw");
++    WgpuProxySync([&] { wgpu_draw_js(base, count); });
++    return;
++  }
++  wgpu_draw_js(base, count);
++}
++
++static void wgpu_draw_indexed(int bi, int count, int bv)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_draw_indexed");
++    WgpuProxySync([&] { wgpu_draw_indexed_js(bi, count, bv); });
++    return;
++  }
++  wgpu_draw_indexed_js(bi, count, bv);
++}
++
++static int wgpu_st_create()
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_st_create");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_st_create_js(); });
++    return r;
++  }
++  return wgpu_st_create_js();
++}
++
++static void wgpu_st_destroy(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_st_destroy");
++    WgpuProxySync([&] { wgpu_st_destroy_js(id); });
++    return;
++  }
++  wgpu_st_destroy_js(id);
++}
++
++static void wgpu_st_copy_from(int sid, int tid, int layer, int level, int sx, int sy, int w, int h, int off, int stride)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_st_copy_from");
++    WgpuProxySync([&] { wgpu_st_copy_from_js(sid, tid, layer, level, sx, sy, w, h, off, stride); });
++    return;
++  }
++  wgpu_st_copy_from_js(sid, tid, layer, level, sx, sy, w, h, off, stride);
++}
++
++static void wgpu_st_flush(int id)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_st_flush");
++    WgpuProxySync([&] { wgpu_st_flush_js(id); });
++    return;
++  }
++  wgpu_st_flush_js(id);
++}
++
++static int wgpu_st_read(int id, void* p)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_st_read");
++    int r = 0;
++    WgpuProxySync([&] { r = wgpu_st_read_js(id, p); });
++    return r;
++  }
++  return wgpu_st_read_js(id, p);
++}
++
++static void wgpu_flush()
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_flush");
++    WgpuProxySync([&] { wgpu_flush_js(); });
++    return;
++  }
++  wgpu_flush_js();
++}
++
++static void wgpu_present(int tid, unsigned fbo)
++{
++  if (!emscripten_is_main_browser_thread())
++  {
++    WgpuOffMain("wgpu_present");
++    WgpuProxySync([&] { wgpu_present_js(tid, fbo); });
++    return;
++  }
++  wgpu_present_js(tid, fbo);
++}
 +
 +namespace WGPU
 +{
@@ -7393,7 +7769,7 @@ index deb005b..65a1ea1 100644
  #endif
  
 diff --git a/Source/Core/VideoCommon/Fifo.cpp b/Source/Core/VideoCommon/Fifo.cpp
-index 42e3362..c9b0cff 100644
+index 42e3362..898b171 100644
 --- a/Source/Core/VideoCommon/Fifo.cpp
 +++ b/Source/Core/VideoCommon/Fifo.cpp
 @@ -3,6 +3,9 @@
@@ -7406,14 +7782,14 @@ index 42e3362..c9b0cff 100644
  #include <atomic>
  #include <cstring>
  
-@@ -301,14 +304,37 @@ void FifoManager::RunGpuLoop()
+@@ -301,6 +304,20 @@ void FifoManager::RunGpuLoop()
  #ifdef __LIBRETRO__
          if (m_stop_gpu_loop_requested.load())
            m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
 +#endif
 +#ifdef __LIBRETRO__
 +        if (m_stop_when_cpu_idle &&
-+            ((m_system.GetCPU().IsCPUThreadIdle() && IsGpuFifoDrained()) ||
++            (m_system.GetCPU().IsCPUThreadIdle() ||
 +             Common::Timer::NowUs() >= m_stop_deadline_us))
 +          m_gpu_mainloop.Stop(Common::BlockingLoop::StopMode::NonBlock);
 +#ifdef __EMSCRIPTEN__
@@ -7427,24 +7803,7 @@ index 42e3362..c9b0cff 100644
  #endif
  
          // Run events from the CPU thread.
-         AsyncRequests::GetInstance()->PullEvents();
- 
-         // Do nothing while paused
-+#ifdef __LIBRETRO__
-+        // ...except when draining at the end of a frame: the CPU thread pauses
-+        // as soon as it ends the frame, often well ahead of the GPU. Leaving the
-+        // rest of the FIFO for the next frame lets the CPU overwrite textures
-+        // and vertex data before the GPU has read them (texture smearing).
-+        if (!m_emu_running_state.IsSet() && !m_stop_when_cpu_idle)
-+          return;
-+#else
-         if (!m_emu_running_state.IsSet())
-           return;
-+#endif
- 
-         if (m_use_deterministic_gpu_thread)
-         {
-@@ -401,12 +427,41 @@ void FifoManager::RunGpuLoop()
+@@ -401,12 +418,41 @@ void FifoManager::RunGpuLoop()
            g_framebuffer_manager->RefreshPeekCache();
          }
        },
@@ -7474,7 +7833,7 @@ index 42e3362..c9b0cff 100644
 +
 +void FifoManager::RunGpuLoopUntilCPUIdle(int max_ms)
 +{
-+  if (m_system.GetCPU().IsCPUThreadIdle() && IsGpuFifoDrained())
++  if (m_system.GetCPU().IsCPUThreadIdle())
 +    return;
 +  m_stop_when_cpu_idle = true;
 +  m_stop_deadline_us = Common::Timer::NowUs() + static_cast<u64>(max_ms) * 1000;

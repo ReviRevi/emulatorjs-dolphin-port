@@ -475,7 +475,7 @@ core, on the main thread, the wait now runs the GPU loop in 2 ms slices
 (`WaitForCPUThreadIdle`). Not reproduced headless; written for reports of
 Gauntlet freezing at boot in dual core.
 
-### Dual core: drain the GPU FIFO at the end of each frame (texture smear)
+### Dual core: drain the GPU FIFO at the end of each frame (tried, reverted)
 
 Smear and the Wind Waker post-cutscene crash appear only in dual core. The CPU
 thread pauses as soon as it ends a frame, often far ahead of the GPU, and the
@@ -484,3 +484,16 @@ next frame's CPU work then overwrote textures and vertex data the GPU hadn't
 read yet. `RunGpuLoopUntilCPUIdle` (after each frame, 200 ms cap) now keeps
 processing the FIFO while paused and only stops once the CPU is parked and
 the FIFO is drained (`IsGpuFifoDrained`).
+
+Reverted: the smear stayed and Paper Mario fell from ~80% to ~60%.
+
+### Dual core: WebGPU calls from other threads are proxied to the main thread
+
+The WebGPU device and every object the backend made live in the browser's
+main thread; a call from the CPU thread would find no `Module.__wgpu` there
+and throw (an uncaught worker error shows as "Uncaught [object ErrorEvent]",
+like the Wind Waker crash after a few minutes in dual core). Each backend
+EM_JS call now checks the thread; off the main thread it runs synchronously
+on the main thread (emscripten system proxying queue) and logs
+`[wgpu] call from a non-main thread, proxied: <name>` with a stack trace,
+once per function. Headless test programs log none.
